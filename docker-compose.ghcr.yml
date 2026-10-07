@@ -50,17 +50,6 @@ x-backend-runtime: &backend-runtime
       max-file: ${CONTAINER_LOG_MAX_FILES:-5}
 
 services:
-  env-sync:
-    image: ${BACKEND_IMAGE:-ghcr.io/openbyteinc/quantdinger-backend}:${BACKEND_TAG:-${IMAGE_TAG:-latest}}
-    pull_policy: always
-    container_name: quantdinger-env-sync
-    restart: "no"
-    entrypoint: ["python", "-m", "app.commands.sync_env", "--workspace", "/workspace"]
-    volumes:
-      - ./:/workspace
-    networks:
-      - quantdinger-network
-
   postgres:
     image: ${POSTGRES_IMAGE:-${IMAGE_PREFIX:-}postgres:18.3-alpine}
     container_name: quantdinger-db
@@ -173,12 +162,9 @@ services:
     restart: "no"
     command: ["python", "-m", "app.commands.kafka_topics"]
     depends_on:
-      env-sync:
-        condition: service_completed_successfully
       kafka:
         condition: service_healthy
     volumes:
-      - ./.env:/app/.env
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_REPLICATION_FACTOR=${KAFKA_REPLICATION_FACTOR:-1}
@@ -202,7 +188,6 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./.env:/app/.env
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-quantdinger}:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/${POSTGRES_DB:-quantdinger}
       - DB_TYPE=postgresql
@@ -242,7 +227,6 @@ services:
       # /app/.env. The entrypoint will auto-generate SECRET_KEY on first start
       # and write it back through the bind mount, so the host file gets the
       # generated key persistently.
-      - ./.env:/app/.env
     environment:
       - PYTHON_API_HOST=0.0.0.0
       - PYTHON_API_PORT=5000
@@ -307,7 +291,6 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=trading
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -342,8 +325,6 @@ services:
     restart: unless-stopped
     command: ["python", "-m", "app.commands.kafka_audit_worker"]
     depends_on:
-      env-sync:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       migration:
@@ -352,7 +333,6 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=kafka-audit
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -390,7 +370,6 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=strategy-dispatcher
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -429,7 +408,6 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=strategy-evaluator
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -468,7 +446,6 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=scheduler
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -508,7 +485,6 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=celery
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -553,7 +529,6 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./.env:/app/.env
     environment:
       - QD_PROCESS_ROLE=celery
       - LOG_FORMAT=${LOG_FORMAT:-json}
