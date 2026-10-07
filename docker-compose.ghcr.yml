@@ -164,7 +164,6 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    volumes:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_REPLICATION_FACTOR=${KAFKA_REPLICATION_FACTOR:-1}
