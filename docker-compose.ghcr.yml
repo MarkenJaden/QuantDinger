@@ -78,7 +78,7 @@ services:
       - "-c"
       - "shared_buffers=${PG_SHARED_BUFFERS:-256MB}"
     volumes:
-      - ${POSTGRES_DATA_SOURCE:-postgres_data}:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
+      - postgres_data:/var/lib/postgresql/18/docker
     ports:
       - "${DB_PORT:-127.0.0.1:5432}:5432"
     networks:
@@ -593,6 +593,18 @@ services:
       - backend
     networks:
       - quantdinger-network
+      - markenjaden
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=markenjaden"
+      - "traefik.http.routers.quantdinger.rule=Host(`quantdinger.markenjaden.de`)"
+      - "traefik.http.routers.quantdinger.entrypoints=https"
+      - "traefik.http.routers.quantdinger.tls=true"
+      - "traefik.http.routers.quantdinger.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.quantdinger-http.rule=Host(`quantdinger.markenjaden.de`)"
+      - "traefik.http.routers.quantdinger-http.entrypoints=http"
+      - "traefik.http.routers.quantdinger-http.middlewares=redirect-to-https@docker"
+      - "traefik.http.services.quantdinger.loadbalancer.server.port=80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/health"]
       interval: 30s
@@ -619,6 +631,17 @@ services:
       timeout: 10s
       retries: 3
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: quantdinger-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    networks:
+      - quantdinger-network
+
 volumes:
   postgres_data:
     driver: local
@@ -630,7 +653,11 @@ volumes:
     driver: local
   kafka_data:
     driver: local
+  ollama_data:
+    driver: local
 
 networks:
   quantdinger-network:
     driver: bridge
+  markenjaden:
+    external: true
