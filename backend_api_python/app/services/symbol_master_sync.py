@@ -76,6 +76,23 @@ STATIC_MARKET_ROWS = [
     SymbolMasterRow("Crypto", "PEPE/USDT", "Pepe", "binance", "USDT"),
     SymbolMasterRow("Crypto", "SHIB/USDT", "Shiba Inu", "binance", "USDT"),
     SymbolMasterRow("Crypto", "WLD/USDT", "Worldcoin", "binance", "USDT"),
+    SymbolMasterRow("Crypto", "BTC/USDC", "Bitcoin", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "ETH/USDC", "Ethereum", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "SOL/USDC", "Solana", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "BNB/USDC", "BNB", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "XRP/USDC", "XRP", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "DOGE/USDC", "Dogecoin", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "ADA/USDC", "Cardano", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "AVAX/USDC", "Avalanche", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "LINK/USDC", "Chainlink", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "DOT/USDC", "Polkadot", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "SUI/USDC", "Sui", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "NEAR/USDC", "NEAR Protocol", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "LTC/USDC", "Litecoin", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "UNI/USDC", "Uniswap", "binance", "USDC"),
+    SymbolMasterRow("Crypto", "BTC/EUR", "Bitcoin", "binance", "EUR"),
+    SymbolMasterRow("Crypto", "ETH/EUR", "Ethereum", "binance", "EUR"),
+    SymbolMasterRow("Crypto", "SOL/EUR", "Solana", "binance", "EUR"),
     SymbolMasterRow("Forex", "XAUUSD", "Gold Spot", "TwelveData", "USD"),
     SymbolMasterRow("Forex", "XAGUSD", "Silver Spot", "TwelveData", "USD"),
     SymbolMasterRow("Forex", "EURUSD", "Euro / US Dollar", "TwelveData", "USD"),
@@ -304,7 +321,7 @@ def fetch_crypto_symbols_with_diagnostics():
                 is_target = bool(info.get("spot")) if market_type == "spot" else bool(info.get("swap"))
                 quote = _clean_symbol(info.get("quote"))
                 base = _clean_symbol(info.get("base"))
-                if not info.get("active") or not is_target or quote != "USDT" or not base:
+                if not info.get("active") or not is_target or quote not in ("USDT", "USDC", "EUR", "USD") or not base:
                     continue
                 normalized_symbol = normalize_crypto_symbol(symbol)
                 instrument_id = _clean_text(info.get("id") or symbol)
@@ -322,7 +339,7 @@ def fetch_crypto_symbols_with_diagnostics():
                         normalized_symbol,
                         _clean_text(info.get("displayName") or info.get("name") or base),
                         exchange_id,
-                        "USDT",
+                        quote,
                         market_type,
                         instrument_id,
                         _clean_symbol(info.get("settle") or quote),
@@ -769,7 +786,7 @@ def _okx_public_payload_to_rows(payload: dict, market_type: str, classify_asset)
         if market_type == "spot":
             base = _clean_symbol(item.get("baseCcy"))
             quote = _clean_symbol(item.get("quoteCcy"))
-            if quote != "USDT":
+            if quote not in ("USDT", "USDC", "EUR", "USD"):
                 continue
         else:
             settle = _clean_symbol(item.get("settleCcy"))

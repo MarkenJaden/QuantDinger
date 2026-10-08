@@ -237,7 +237,7 @@ def _search_crypto_exchange(
             ex.load_markets()
             markets = []
             for sym, info in ex.markets.items():
-                if not info.get("active") or info.get("quote", "") != "USDT":
+                if not info.get("active") or info.get("quote", "") not in ("USDT", "USDC", "EUR", "USD"):
                     continue
                 is_target_type = bool(info.get("spot")) if market_type == "spot" else bool(info.get("swap"))
                 if not is_target_type:
@@ -269,7 +269,7 @@ def _search_crypto_exchange(
                 market_type,
             )
 
-        kw = keyword.upper().replace("/USDT", "").replace("/", "")
+        kw = keyword.upper().replace("/USDT", "").replace("/USDC", "").replace("/EUR", "").replace("/USD", "").replace("/", "")
         results = []
         for item in markets:
             symbol = item["symbol"]
