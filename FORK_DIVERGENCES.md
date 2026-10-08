@@ -31,7 +31,8 @@ It is consulted during automated upstream synchronization and CI validation (via
 - **Automated Upstream Synchronization (`.github/workflows/upstream-sync.yml`)**:
   - Automatically syncs from upstream `OpenByteInc/QuantDinger` (`main`) daily.
   - Automatically resolves non-divergent changes, and applies AI resolution via Gemini for conflicts, preserving the USDC/EUR fork features specified above.
-- **Coolify Integration**:
+- **Image Publishing & Coolify Integration**:
+  - `.github/workflows/docker-publish.yml` builds and pushes the backend image to `ghcr.io/markenjaden/quantdinger-backend:latest` on push to `main` (for linux/amd64).
+  - Coolify is configured to run `BACKEND_IMAGE=ghcr.io/markenjaden/quantdinger-backend`, ensuring custom fork features (USDC/EUR symbols, search filters, MiCA support) execute in production.
   - Deployments are hosted on a self-hosted Coolify instance (`https://quantdinger.markenjaden.de`).
-  - In `docker-compose.ghcr.yml`, Python services mount `./backend_api_python/app:/app/app:ro` so the fork's code customizations execute directly without requiring custom image rebuilds.
-  - Merged and validated commits pushed to `main` trigger Coolify redeployments.
+

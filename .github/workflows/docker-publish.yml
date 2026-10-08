@@ -19,6 +19,8 @@ name: Publish backend image to GHCR
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -63,7 +65,7 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
             type=sha,format=short
 
       - name: Resolve application version
@@ -85,7 +87,7 @@ jobs:
         with:
           context: ./backend_api_python
           file: ./backend_api_python/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           build-args: |
             BUILD_REGION=global
