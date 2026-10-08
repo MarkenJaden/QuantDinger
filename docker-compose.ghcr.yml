@@ -165,6 +165,8 @@ services:
       - KAFKA_STRATEGY_PARTITIONS=${KAFKA_STRATEGY_PARTITIONS:-128}
       - KAFKA_ORDER_PARTITIONS=${KAFKA_ORDER_PARTITIONS:-96}
       - KAFKA_DLQ_PARTITIONS=${KAFKA_DLQ_PARTITIONS:-24}
+    volumes:
+      - ./backend_api_python/app:/app/app:ro
     networks:
       - quantdinger-network
 
@@ -181,6 +183,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-quantdinger}:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/${POSTGRES_DB:-quantdinger}
       - DB_TYPE=postgresql
@@ -213,6 +216,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
       # Backend runtime config. Must exist as a *file* on the host - if missing,
       # docker silently creates a directory at the mount target and shadows
       # /app/.env. The entrypoint will auto-generate SECRET_KEY on first start
@@ -282,6 +286,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=trading
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -324,6 +329,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=kafka-audit
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -361,6 +367,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=strategy-dispatcher
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -399,6 +406,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - backend_logs:/app/logs
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=strategy-evaluator
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -437,6 +445,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=scheduler
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -476,6 +485,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=celery
       - LOG_FORMAT=${LOG_FORMAT:-json}
@@ -520,6 +530,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      - ./backend_api_python/app:/app/app:ro
     environment:
       - QD_PROCESS_ROLE=celery
       - LOG_FORMAT=${LOG_FORMAT:-json}

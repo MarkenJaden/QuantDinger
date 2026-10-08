@@ -33,4 +33,5 @@ It is consulted during automated upstream synchronization and CI validation (via
   - Automatically resolves non-divergent changes, and applies AI resolution via Gemini for conflicts, preserving the USDC/EUR fork features specified above.
 - **Coolify Integration**:
   - Deployments are hosted on a self-hosted Coolify instance (`https://quantdinger.markenjaden.de`).
-  - Merged and validated commits pushed to `main` trigger Coolify webhook rebuilds.
+  - In `docker-compose.ghcr.yml`, Python services mount `./backend_api_python/app:/app/app:ro` so the fork's code customizations execute directly without requiring custom image rebuilds.
+  - Merged and validated commits pushed to `main` trigger Coolify redeployments.
