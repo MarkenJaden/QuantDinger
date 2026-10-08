@@ -36,3 +36,21 @@ It is consulted during automated upstream synchronization and CI validation (via
   - Coolify is configured to run `BACKEND_IMAGE=ghcr.io/markenjaden/quantdinger-backend`, ensuring custom fork features (USDC/EUR symbols, search filters, MiCA support) execute in production.
   - Deployments are hosted on a self-hosted Coolify instance (`https://quantdinger.markenjaden.de`).
 
+---
+
+## 3. Binance Crypto Classification (bStock False Positives Fix)
+
+- **Context & Motivation**:
+  - The upstream classification logic in `app/services/market/instrument_products.py` contained a heuristic for legacy Binance bStocks (stock tokens): `exchange == "binance" and mt == "spot" and base.endswith("B") and base[:-1] in known_equities`.
+  - In production, `known_equity_symbols` ingests over 10,000 US & HK stock tickers from Nasdaq, NYSE, and HKEX, including short tickers like `BN` (Brookfield), `AR` (Antero Resources), `SU`, `ST`, `VI`, `AM`, etc.
+  - This heuristic falsely classified major cryptocurrencies on Binance ending with "B" (most notably **`BNB`**, **`ARB`**, **`SLB`**, etc.) as `tokenized_equity` rather than `crypto`.
+  - When deploying live strategies targeting Binance `@spot` with `BNB` or `ARB`, Strategy V2 preflight rejected them with `strategyV2.equityProductVenueRequired` (*"Select the exchange explicitly for this exchange-listed equity product"*), because equity products require explicit venue declarations.
+  - Binance permanently terminated stock tokens in October 2021; real bStocks only ever existed for ~6 large cap tech tickers (`TSLAB`, `COINB`, `AAPLB`, `MSFTB`, `MSTRB`, `NVDAB`).
+- **Divergence Details**:
+  - **`backend_api_python/app/services/market/instrument_products.py`**:
+    - Added `crypto_native_bases` guard (`BNB`, `ARB`, `SHIB`, `SLB`, etc.) and `len(base) >= 5` requirement for `binance_bstock` matching.
+    - Prevents standard 3- and 4-letter cryptocurrencies from colliding with equity ticker substrings.
+  - **`backend_api_python/migrations/init.sql`**:
+    - Includes automatic repair query on boot to reset falsely classified Binance spot equity rows in `qd_market_symbols` back to `product_type = 'crypto'` and `asset_class = 'crypto'`.
+
+

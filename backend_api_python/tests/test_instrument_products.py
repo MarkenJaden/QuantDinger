@@ -200,3 +200,18 @@ def test_ordinary_crypto_remains_crypto():
     assert profile.asset_class == "crypto"
     assert profile.product_type == PRODUCT_CRYPTO
     assert profile.api_family == "swap"
+
+
+def test_binance_crypto_ending_in_b_remains_crypto():
+    for coin in ("BNB", "ARB", "SHIB"):
+        profile = classify_instrument_product(
+            {"base": coin, "info": {"symbol": f"{coin}USDT"}},
+            exchange_id="binance",
+            market_type="spot",
+            symbol=f"{coin}/USDT",
+            instrument_id=f"{coin}USDT",
+            known_equity_symbols={"BN", "AR", "SHI", "NVDA"},
+        )
+        assert profile.asset_class == "crypto"
+        assert profile.product_type == PRODUCT_CRYPTO
+

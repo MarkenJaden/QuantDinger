@@ -3250,3 +3250,20 @@ DROP TRIGGER IF EXISTS trg_cleanup_deleted_strategy ON qd_strategies_trading;
 CREATE TRIGGER trg_cleanup_deleted_strategy
 BEFORE DELETE ON qd_strategies_trading
 FOR EACH ROW EXECUTE FUNCTION qd_cleanup_deleted_strategy();
+
+-- Fix falsely classified Binance spot equity products (e.g. BNB, ARB)
+UPDATE qd_market_symbols
+   SET product_type = 'crypto',
+       asset_class = 'crypto',
+       underlying_market = '',
+       underlying_symbol = ''
+ WHERE exchange = 'binance'
+   AND market_type = 'spot'
+   AND product_type != 'crypto'
+   AND symbol NOT LIKE 'TSLAB%'
+   AND symbol NOT LIKE 'COINB%'
+   AND symbol NOT LIKE 'AAPLB%'
+   AND symbol NOT LIKE 'MSFTB%'
+   AND symbol NOT LIKE 'MSTRB%'
+   AND symbol NOT LIKE 'NVDAB%';
+

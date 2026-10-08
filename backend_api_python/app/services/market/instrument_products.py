@@ -68,9 +68,15 @@ def classify_instrument_product(
         for value in (known_equity_symbols or ())
         if str(value or "").strip()
     }
+    crypto_native_bases = {
+        "BNB", "ARB", "SHIB", "SLB", "CRB", "GLB", "AMB", "MOB", "SUB",
+        "STB", "VIB", "OGB", "CLB", "TNB", "LAMB", "CLVB", "B",
+    }
     binance_bstock = (
         exchange == "binance"
         and mt == "spot"
+        and base not in crypto_native_bases
+        and len(base) >= 5
         and base.endswith("B")
         and base[:-1] in known_equities
     )
