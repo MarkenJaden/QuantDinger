@@ -463,6 +463,27 @@ def build_ownership_rows(
             prices[canonical_symbol(row.get("symbol") or "")] = price
     account = aggregate(account_rows)
     allocated = aggregate(allocated_rows)
+
+    from app.services.live_trading.symbols import _split_base_quote
+
+    # For spot positions: if account rows were keyed with another quote currency (e.g. BTC/USDT)
+    # but allocated rows are for BTC/USDC, align account inventory to the allocated key
+    allocated_bases = {
+        _split_base_quote(sym)[0].upper(): (sym, side)
+        for (sym, side) in allocated.keys()
+        if _split_base_quote(sym)[0]
+    }
+    remap_account = dict(account)
+    for (acct_sym, acct_side), acct_qty in list(account.items()):
+        if (acct_sym, acct_side) not in allocated:
+            acct_base = _split_base_quote(acct_sym)[0].upper()
+            if acct_base in allocated_bases:
+                target_key = allocated_bases[acct_base]
+                if target_key[1] == acct_side:
+                    remap_account[target_key] = remap_account.get(target_key, 0.0) + acct_qty
+                    remap_account.pop((acct_sym, acct_side), None)
+    account = remap_account
+
     reservations = {
         (canonical_symbol(row.get("symbol_canonical") or row.get("symbol") or ""), normalize_side(row.get("side") or "")): row
         for row in reservation_rows or []

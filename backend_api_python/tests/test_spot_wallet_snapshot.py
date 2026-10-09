@@ -123,3 +123,72 @@ def test_spot_wallet_exchange_errors_are_not_silenced(monkeypatch):
     monkeypatch.setattr(BitgetSpotClient, "get_assets", fail_get_assets)
     with pytest.raises(LiveTradingError, match="spot assets unavailable"):
         list_spot_wallet_positions(client)
+
+
+def test_binance_spot_balances_parser_custom_quote():
+    raw = {
+        "balances": [
+            {"asset": "BTC", "free": "0.00056946", "locked": "0"},
+            {"asset": "SOL", "free": "0.43258865", "locked": "0"},
+            {"asset": "USDC", "free": "10.5", "locked": "0"},
+        ]
+    }
+    rows = _from_binance_spot_account(raw, quote_currency="USDC")
+    btc = next(r for r in rows if r["symbol"] == "BTC/USDC")
+    assert btc["size"] == 0.00056946
+    assert btc["base_asset"] == "BTC"
+    sol = next(r for r in rows if r["symbol"] == "SOL/USDC")
+    assert sol["size"] == 0.43258865
+    assert sol["base_asset"] == "SOL"
+    usdc = next(r for r in rows if r["symbol"] == "USDC")
+    assert usdc["size"] == 10.5
+
+
+def test_spot_ownership_reconciles_usdc_strategy_with_usdt_snapshot():
+    from app.services.live_trading.account_positions import (
+        filter_position_rows_by_symbols,
+        reconcile_strategy_vs_account,
+        snapshot_rows_to_account_legs,
+    )
+    from app.services.live_trading.position_ownership import build_ownership_rows
+
+    # Account snapshot has BTC/USDT and SOL/USDT by default
+    raw_account = [
+        {"symbol": "BTC/USDT", "side": "long", "size": 0.00056946, "market_type": "spot"},
+        {"symbol": "SOL/USDT", "side": "long", "size": 0.43258865, "market_type": "spot"},
+    ]
+    account_legs = snapshot_rows_to_account_legs(raw_account)
+
+    # Strategy trades USDC pairs
+    allowed = ["BTC/USDC", "SOL/USDC"]
+    allocated = [
+        {"symbol": "BTC/USDC", "side": "long", "size": 0.00056946},
+        {"symbol": "SOL/USDC", "side": "long", "size": 0.43258865},
+    ]
+
+    # 1. filter_position_rows_by_symbols maps spot base assets to allowed USDC pairs
+    filtered = filter_position_rows_by_symbols(account_legs, allowed, market_type="spot")
+    assert len(filtered) == 2
+    assert {r["symbol"] for r in filtered} == {"BTC/USDC", "SOL/USDC"}
+
+    # 2. reconcile_strategy_vs_account reconciles as ok
+    rec = reconcile_strategy_vs_account(allocated, filtered)
+    assert rec["status"] == "ok"
+    assert rec["notes"] == []
+
+    # 3. Direct reconcile also handles raw account rows with cross-quote spot matching
+    rec_direct = reconcile_strategy_vs_account(allocated, account_legs)
+    assert rec_direct["status"] == "ok"
+
+    # 4. build_ownership_rows matches without false positive shortfall
+    rows = build_ownership_rows(
+        account_rows=account_legs,
+        allocated_rows=allocated,
+        reservation_rows=[],
+    )
+    assert len(rows) == 2
+    for r in rows:
+        assert r["status"] == "ok"
+        assert r["repair_kind"] == "none"
+        assert r["unknown_qty"] == pytest.approx(0.0)
+

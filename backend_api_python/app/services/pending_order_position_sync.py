@@ -575,9 +575,20 @@ class PendingOrderPositionSyncMixin:
 
                     elif market_type == "spot":
                         from app.services.live_trading.spot_wallet_snapshot import list_spot_wallet_positions
+                        from app.services.live_trading.symbols import _split_base_quote
+
+                        # Infer strategy's primary quote currency from allowed_symbols (e.g. USDC or EUR)
+                        primary_quote = "USDT"
+                        base_to_allowed = {}
+                        for _asym in (allowed_symbols or []):
+                            _b, _q = _split_base_quote(_asym)
+                            if _b:
+                                base_to_allowed[_b.upper()] = _asym
+                            if _q and primary_quote == "USDT":
+                                primary_quote = _q.upper()
 
                         try:
-                            spot_rows = list_spot_wallet_positions(client) or []
+                            spot_rows = list_spot_wallet_positions(client, quote_currency=primary_quote) or []
                         except Exception as e:
                             if is_file_descriptor_exhausted(e):
                                 set_exchange_sync_backoff(cache_key, seconds=_position_sync_fd_backoff_sec())
@@ -591,9 +602,14 @@ class PendingOrderPositionSyncMixin:
                         for row in spot_rows:
                             if not isinstance(row, dict):
                                 continue
-                            sym = normalize_strategy_symbol(str(row.get("symbol") or "")) or str(
-                                row.get("symbol") or ""
-                            ).strip()
+                            raw_sym = str(row.get("symbol") or "").strip()
+                            base_asset = str(row.get("base_asset") or "").strip().upper()
+                            if not base_asset and raw_sym:
+                                base_asset = _split_base_quote(raw_sym)[0].upper()
+                            if base_asset in base_to_allowed:
+                                sym = base_to_allowed[base_asset]
+                            else:
+                                sym = normalize_strategy_symbol(raw_sym) or raw_sym
                             side = str(row.get("side") or "long").strip().lower()
                             try:
                                 sz = float(row.get("size") or 0.0)
@@ -606,8 +622,9 @@ class PendingOrderPositionSyncMixin:
                             if ep > 0:
                                 exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
                             iid = str(row.get("inst_id") or "")
-                            if iid:
-                                exch_inst_id.setdefault(sym, {"long": "", "short": ""})[side] = iid
+                            if not iid:
+                                iid = sym.replace("/", "-")
+                            exch_inst_id.setdefault(sym, {"long": "", "short": ""})[side] = iid
 
                     else:
                         logger.debug(f"position sync: skip unsupported market/client: sid={sid}, cfg={safe_cfg}, market_type={market_type}, client={type(client)}")
@@ -629,6 +646,63 @@ class PendingOrderPositionSyncMixin:
                     )
                 except Exception as l1_err:
                     logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
+
+                # Auto-recover position ownership status if account covers strategy allocations
+                try:
+                    from app.services.live_trading.position_ownership import (
+                        list_reservations,
+                        evaluate_and_record_ownership,
+                        STATUS_BLOCKED,
+                        supports_position_coexistence,
+                    )
+                    from app.services.live_trading.records import fetch_allocated_position_size
+                    from app.services.live_trading.symbols import _split_base_quote
+
+                    if supports_position_coexistence(market_type, exchange_id):
+                        blocked_reservations = [
+                            r for r in list_reservations(
+                                user_id=int(sync_user_id),
+                                credential_id=cred_id,
+                                market_type=str(market_type or "swap"),
+                            )
+                            if str(r.get("status") or "") == STATUS_BLOCKED
+                        ]
+                        for b_row in blocked_reservations:
+                            b_sym = str(b_row.get("symbol_canonical") or b_row.get("symbol") or "")
+                            b_side = str(b_row.get("side") or "long").strip().lower()
+                            if not b_sym or b_side not in ("long", "short"):
+                                continue
+                            b_acct = float(exch_size.get(b_sym, {}).get(b_side, 0.0))
+                            if b_acct <= 0 and market_type == "spot":
+                                b_base = _split_base_quote(b_sym)[0].upper()
+                                for e_sym, e_sides in exch_size.items():
+                                    if _split_base_quote(e_sym)[0].upper() == b_base:
+                                        b_acct = float(e_sides.get(b_side, 0.0))
+                                        break
+                            b_strat = fetch_allocated_position_size(
+                                strategy_id=int(sid),
+                                credential_id=cred_id,
+                                market_type=str(market_type or "swap"),
+                                symbol=b_sym,
+                                side=b_side,
+                            )
+                            if b_acct + 1e-8 >= b_strat:
+                                logger.info(
+                                    "[PositionSync] Auto-recovering blocked reservation: sid=%s %s %s account=%s strat=%s",
+                                    sid, b_sym, b_side, b_acct, b_strat
+                                )
+                                evaluate_and_record_ownership(
+                                    user_id=int(sync_user_id),
+                                    credential_id=cred_id,
+                                    exchange_id=str(exchange_id or ""),
+                                    market_type=str(market_type or "swap"),
+                                    symbol=b_sym,
+                                    side=b_side,
+                                    account_qty=b_acct,
+                                    strategy_qty=b_strat,
+                                )
+                except Exception as rec_err:
+                    logger.debug("[PositionSync] Auto-recovery check failed: %s", rec_err)
 
                 # [DEBUG] Log all normalized exchange keys for inspection
                 logger.debug(f"[PositionSync] Strategy {sid} Exchange Keys: {list(exch_size.keys())}")

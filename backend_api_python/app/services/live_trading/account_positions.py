@@ -182,7 +182,9 @@ def list_account_positions(
 
 
 def filter_position_rows_by_symbols(
-    rows: List[Dict[str, Any]], allowed_symbols: Optional[List[str]]
+    rows: List[Dict[str, Any]],
+    allowed_symbols: Optional[List[str]],
+    market_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Keep account/ownership rows inside the current strategy universe."""
     allowed = {
@@ -192,14 +194,42 @@ def filter_position_rows_by_symbols(
     }
     if not allowed:
         return list(rows or [])
-    return [
-        row
-        for row in (rows or [])
-        if normalize_strategy_symbol(
+
+    from app.services.live_trading.symbols import _split_base_quote
+
+    # For spot trading, map base asset to the strategy's trading pair (e.g. BTC -> BTC/USDC)
+    base_to_allowed: Dict[str, str] = {}
+    for s in (allowed_symbols or []):
+        norm = normalize_strategy_symbol(str(s or "")).upper()
+        if not norm:
+            continue
+        base, _ = _split_base_quote(norm)
+        if base:
+            base_to_allowed[base] = norm
+
+    filtered: List[Dict[str, Any]] = []
+    for row in (rows or []):
+        row_sym = normalize_strategy_symbol(
             str(row.get("symbol_canonical") or row.get("symbol") or "")
         ).upper()
-        in allowed
-    ]
+        if row_sym in allowed:
+            filtered.append(row)
+            continue
+        is_spot = (
+            str(market_type or "").strip().lower() == "spot"
+            or str(row.get("market_type") or "").strip().lower() == "spot"
+        )
+        if is_spot:
+            base = str(row.get("base_asset") or "").strip().upper()
+            if not base and row_sym:
+                base, _ = _split_base_quote(row_sym)
+            if base and base in base_to_allowed:
+                matching_sym = base_to_allowed[base]
+                mapped = dict(row)
+                mapped["symbol"] = matching_sym
+                mapped["symbol_canonical"] = matching_sym
+                filtered.append(mapped)
+    return filtered
 
 
 def reconcile_strategy_vs_account(
@@ -240,6 +270,27 @@ def reconcile_strategy_vs_account(
     )
     include_ownership = protected_rows is not None
     acct: Dict[tuple, float] = aggregate(account_rows or [])
+
+    from app.services.live_trading.symbols import _split_base_quote
+
+    # Align account spot holdings by base asset to allocated strategy symbols
+    # (e.g. account holding BTC/USDT covers strategy allocation for BTC/USDC)
+    allocated_bases = {
+        _split_base_quote(sym)[0].upper(): (sym, side)
+        for (sym, side) in allocations.keys()
+        if _split_base_quote(sym)[0]
+    }
+    remap_acct = dict(acct)
+    for (acct_sym, acct_side), acct_qty in list(acct.items()):
+        if (acct_sym, acct_side) not in allocations:
+            acct_base = _split_base_quote(acct_sym)[0].upper()
+            if acct_base in allocated_bases:
+                target_key = allocated_bases[acct_base]
+                if target_key[1] == acct_side:
+                    remap_acct[target_key] = remap_acct.get(target_key, 0.0) + acct_qty
+                    remap_acct.pop((acct_sym, acct_side), None)
+    acct = remap_acct
+
     from app.services.live_trading.position_ownership import quote_drift_tolerance
 
     prices = {}
@@ -355,6 +406,8 @@ def list_strategy_allocations_for_account(
 
 def snapshot_rows_to_account_legs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize ``fetch_account_snapshot`` position rows for strategy UI."""
+    from app.services.live_trading.symbols import _split_base_quote
+
     out: List[Dict[str, Any]] = []
     for r in rows or []:
         if not isinstance(r, dict):
@@ -370,9 +423,13 @@ def snapshot_rows_to_account_legs(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         mt = str(r.get("market_type") or "swap").strip().lower()
         if mt in ("futures", "future", "perp", "perpetual"):
             mt = "swap"
+        base_asset = str(r.get("base_asset") or "").strip().upper()
+        if not base_asset and sym:
+            base_asset = _split_base_quote(sym)[0].upper()
         out.append(
             {
                 "symbol": sym,
+                "base_asset": base_asset,
                 "side": side,
                 "size": size,
                 "entry_price": float(r.get("entry_price") or 0.0),
@@ -387,15 +444,40 @@ def snapshot_rows_to_account_legs(rows: List[Dict[str, Any]]) -> List[Dict[str, 
 def filter_legs_by_symbols(
     legs: List[Dict[str, Any]],
     allowed_symbols: Optional[set],
+    market_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     if not allowed_symbols:
         return list(legs or [])
     allowed = {normalize_strategy_symbol(s).upper() for s in allowed_symbols if s}
+
+    from app.services.live_trading.symbols import _split_base_quote
+    base_to_allowed: Dict[str, str] = {}
+    for s in allowed_symbols:
+        norm = normalize_strategy_symbol(str(s or "")).upper()
+        if not norm:
+            continue
+        base, _ = _split_base_quote(norm)
+        if base:
+            base_to_allowed[base] = norm
+
     out: List[Dict[str, Any]] = []
     for leg in legs or []:
         sym = normalize_strategy_symbol(str(leg.get("symbol") or "")).upper()
         if sym in allowed:
             out.append(leg)
+            continue
+        is_spot = (
+            str(market_type or "").strip().lower() == "spot"
+            or str(leg.get("market_type") or "").strip().lower() == "spot"
+        )
+        if is_spot:
+            base = str(leg.get("base_asset") or "").strip().upper()
+            if not base and sym:
+                base, _ = _split_base_quote(sym)
+            if base and base in base_to_allowed:
+                mapped = dict(leg)
+                mapped["symbol"] = base_to_allowed[base]
+                out.append(mapped)
     return out
 
 
@@ -438,7 +520,7 @@ def live_account_mirror_for_strategy(
     spot_legs = snapshot_rows_to_account_legs(snap.get("spot_positions") or [])
     account_legs = swap_legs + spot_legs
     reconcile_legs = spot_legs if smt == "spot" else swap_legs
-    reconcile_legs = filter_legs_by_symbols(reconcile_legs, allowed_symbols)
+    reconcile_legs = filter_legs_by_symbols(reconcile_legs, allowed_symbols, market_type=smt)
 
     return {
         "account_legs": account_legs,
@@ -470,10 +552,6 @@ def list_account_positions_for_strategy(
     )
     if not allowed_symbols:
         return rows
-    allowed = {normalize_strategy_symbol(s).upper() for s in allowed_symbols if s}
-    out = []
-    for r in rows:
-        sym = normalize_strategy_symbol(str(r.get("symbol") or "")).upper()
-        if sym in allowed:
-            out.append(r)
-    return out
+    return filter_position_rows_by_symbols(
+        rows, list(allowed_symbols), market_type=ctx.market_type
+    )

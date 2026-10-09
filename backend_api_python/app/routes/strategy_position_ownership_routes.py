@@ -77,19 +77,18 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
         exchange_id=str(resolved.get("exchange_id") or ""),
     )
     allowed_canonical = {canonical_symbol(symbol) for symbol in allowed}
-    if allowed_canonical:
-        account_rows = [
-            row for row in account_rows
-            if canonical_symbol(str(row.get("symbol") or "")) in allowed_canonical
-        ]
+    from app.services.live_trading.account_positions import filter_position_rows_by_symbols
+
     reservations = list_reservations(
         user_id=int(user_id), credential_id=credential_id, market_type=market_type
     )
-    if allowed_canonical:
-        reservations = [
-            row for row in reservations
-            if canonical_symbol(str(row.get("symbol_canonical") or row.get("symbol") or "")) in allowed_canonical
-        ]
+    if allowed:
+        account_rows = filter_position_rows_by_symbols(
+            account_rows, allowed, market_type=market_type
+        )
+        reservations = filter_position_rows_by_symbols(
+            reservations, allowed, market_type=market_type
+        )
     rows = build_ownership_rows(
         account_rows=account_rows,
         allocated_rows=allocated_rows,

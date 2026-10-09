@@ -15,17 +15,25 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _spot_position_row(ccy: str, qty: float, *, entry_price: float = 0.0) -> Dict[str, Any]:
+def _spot_position_row(
+    ccy: str,
+    qty: float,
+    *,
+    entry_price: float = 0.0,
+    quote_currency: str = "USDT",
+) -> Dict[str, Any]:
     ccy_u = str(ccy or "").strip().upper()
+    quote_u = str(quote_currency or "USDT").strip().upper() or "USDT"
     if not ccy_u or qty <= 1e-10:
         return {}
-    if ccy_u == "USDT":
-        symbol, inst_id = "USDT", "USDT"
+    if ccy_u == quote_u:
+        symbol, inst_id = quote_u, quote_u
     else:
-        symbol = normalize_strategy_symbol(f"{ccy_u}/USDT") or f"{ccy_u}/USDT"
-        inst_id = f"{ccy_u}-USDT"
+        symbol = normalize_strategy_symbol(f"{ccy_u}/{quote_u}") or f"{ccy_u}/{quote_u}"
+        inst_id = f"{ccy_u}-{quote_u}"
     return {
         "symbol": symbol,
+        "base_asset": ccy_u,
         "side": "long",
         "size": float(qty),
         "entry_price": float(entry_price or 0.0),
@@ -34,13 +42,20 @@ def _spot_position_row(ccy: str, qty: float, *, entry_price: float = 0.0) -> Dic
     }
 
 
-def _append_row(rows: List[Dict[str, Any]], ccy: str, qty: float, *, entry_price: float = 0.0) -> None:
-    row = _spot_position_row(ccy, qty, entry_price=entry_price)
+def _append_row(
+    rows: List[Dict[str, Any]],
+    ccy: str,
+    qty: float,
+    *,
+    entry_price: float = 0.0,
+    quote_currency: str = "USDT",
+) -> None:
+    row = _spot_position_row(ccy, qty, entry_price=entry_price, quote_currency=quote_currency)
     if row:
         rows.append(row)
 
 
-def _from_okx_balance(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _from_okx_balance(raw: Dict[str, Any], quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     data = (raw.get("data") or []) if isinstance(raw, dict) else []
     first = data[0] if isinstance(data, list) and data else {}
@@ -57,11 +72,11 @@ def _from_okx_balance(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         frozen = _pick_free_from_row(det, "frozenBal")
         qty = total if total > 0 else (avail + frozen if avail > 0 or frozen > 0 else avail)
         entry = _pick_cost_from_row(det, "openAvgPx", "accAvgPx", "avgPx", "avgCost")
-        _append_row(rows, ccy, qty, entry_price=entry)
+        _append_row(rows, ccy, qty, entry_price=entry, quote_currency=quote_currency)
     return rows
 
 
-def _from_binance_spot_account(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _from_binance_spot_account(raw: Dict[str, Any], quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for bal in raw.get("balances") or []:
         if not isinstance(bal, dict):
@@ -72,11 +87,11 @@ def _from_binance_spot_account(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         free = _pick_free_from_row(bal, "free")
         locked = _pick_free_from_row(bal, "locked")
         qty = free + locked
-        _append_row(rows, ccy, qty)
+        _append_row(rows, ccy, qty, quote_currency=quote_currency)
     return rows
 
 
-def _from_bitget_assets(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _from_bitget_assets(raw: Dict[str, Any], quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     data = (raw.get("data") or []) if isinstance(raw, dict) else []
     for row in data if isinstance(data, list) else []:
@@ -91,11 +106,11 @@ def _from_bitget_assets(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         total = _pick_free_from_row(row, "total", "balance")
         qty = total if total > 0 else avail + frozen + locked
         entry = _pick_cost_from_row(row, "averageOpenPrice", "avgOpenPrice", "avgCost", "openAvgPx")
-        _append_row(rows, ccy, qty, entry_price=entry)
+        _append_row(rows, ccy, qty, entry_price=entry, quote_currency=quote_currency)
     return rows
 
 
-def _from_bybit_spot_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _from_bybit_spot_holdings(raw: Dict[str, Any], quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     lst = ((raw.get("result") or {}).get("list") or []) if isinstance(raw, dict) else []
     for item in lst if isinstance(lst, list) else []:
@@ -106,11 +121,11 @@ def _from_bybit_spot_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not ccy:
             continue
         qty = _pick_free_from_row(item, "bal", "walletBalance", "equity", "availableToWithdraw")
-        _append_row(rows, ccy, qty)
+        _append_row(rows, ccy, qty, quote_currency=quote_currency)
     return rows
 
 
-def _from_gate_spot_accounts(raw: Any) -> List[Dict[str, Any]]:
+def _from_gate_spot_accounts(raw: Any, quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     items = raw if isinstance(raw, list) else []
     for row in items:
@@ -122,12 +137,12 @@ def _from_gate_spot_accounts(raw: Any) -> List[Dict[str, Any]]:
         avail = _pick_free_from_row(row, "available", "available_balance")
         locked = _pick_free_from_row(row, "locked", "freeze", "locked_amount")
         qty = avail + locked
-        _append_row(rows, ccy, qty)
+        _append_row(rows, ccy, qty, quote_currency=quote_currency)
     return rows
 
 
 
-def _from_htx_spot_balance(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _from_htx_spot_balance(raw: Dict[str, Any], quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     items = (((raw.get("data") or {}).get("list")) if isinstance(raw, dict) else None) or []
     for row in items if isinstance(items, list) else []:
@@ -137,11 +152,11 @@ def _from_htx_spot_balance(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not ccy:
             continue
         qty = _pick_free_from_row(row, "balance", "available")
-        _append_row(rows, ccy, qty)
+        _append_row(rows, ccy, qty, quote_currency=quote_currency)
     return rows
 
 
-def list_spot_wallet_positions(client: Any) -> List[Dict[str, Any]]:
+def list_spot_wallet_positions(client: Any, quote_currency: str = "USDT") -> List[Dict[str, Any]]:
     """
     Best-effort: all non-zero spot wallet coins for account snapshot / UI.
     Returns rows compatible with ``account_snapshot`` (symbol, side, size, entry_price, market_type).
@@ -157,15 +172,15 @@ def list_spot_wallet_positions(client: Any) -> List[Dict[str, Any]]:
     from app.services.live_trading.okx import OkxClient
 
     if isinstance(client, OkxClient):
-        return _from_okx_balance(client.get_balance() or {})
+        return _from_okx_balance(client.get_balance() or {}, quote_currency=quote_currency)
     if isinstance(client, BinanceSpotClient):
-        return _from_binance_spot_account(client.get_account() or {})
+        return _from_binance_spot_account(client.get_account() or {}, quote_currency=quote_currency)
     if isinstance(client, BitgetSpotClient):
-        return _from_bitget_assets(client.get_assets() or {})
+        return _from_bitget_assets(client.get_assets() or {}, quote_currency=quote_currency)
     if isinstance(client, BybitClient):
-        return _from_bybit_spot_holdings(client.get_spot_holdings() or {})
+        return _from_bybit_spot_holdings(client.get_spot_holdings() or {}, quote_currency=quote_currency)
     if isinstance(client, GateSpotClient):
-        return _from_gate_spot_accounts(client.get_accounts() or [])
+        return _from_gate_spot_accounts(client.get_accounts() or [], quote_currency=quote_currency)
     if isinstance(client, HtxClient) and str(getattr(client, "market_type", "") or "").strip().lower() == "spot":
-        return _from_htx_spot_balance(client.get_balance() or {})
+        return _from_htx_spot_balance(client.get_balance() or {}, quote_currency=quote_currency)
     return []
