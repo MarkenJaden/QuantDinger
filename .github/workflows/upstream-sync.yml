@@ -24,6 +24,7 @@ permissions:
   pull-requests: write
   issues: write
   actions: write
+  workflows: write
 
 jobs:
   sync-and-validate:
@@ -120,7 +121,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "⚠️ Upstream Sync Conflict" \
             --body "Merge conflict occurred when syncing from \`${UPSTREAM_REPO}:${UPSTREAM_BRANCH}\`. Check branch \`${BRANCH_NAME}\`." || \
-            echo "::warning::Could not create PR/Issue via GitHub CLI."
+          echo "::warning::Could not create PR/Issue via GitHub CLI."
           exit 1
 
       - name: Run syntax and consistency checks
@@ -139,4 +140,5 @@ jobs:
         run: |
           echo "All validation checks passed! Pushing to ${TARGET_BRANCH}..."
           git push origin "${TARGET_BRANCH}"
-          echo "Merged changes pushed to origin/${TARGET_BRANCH}. Downstream CI and Coolify deployments will trigger automatically."
+          echo "Triggering Docker image build workflow..."
+          gh workflow run docker-publish.yml --repo "${{ github.repository }}" --ref "${TARGET_BRANCH}" || true

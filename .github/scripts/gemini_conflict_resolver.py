@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Automated Git merge conflict resolver using Google Gemini API with smart filtering and rate-limit handling.
+Automated Git merge conflict resolver using Google Gemini API with smart hunk-by-hunk resolution,
+rate-limit handling, and fork divergence preservation.
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,6 +17,7 @@ from pathlib import Path
 MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-1.5-flash",
 ]
 
@@ -88,7 +91,8 @@ def call_gemini(prompt: str, api_key: str) -> str:
         for attempt in range(2):
             try:
                 print(f"Calling {model} (attempt {attempt + 1})...")
-                time.sleep(3)
+                # Throttle to stay safely within RPM limits
+                time.sleep(4)
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
@@ -138,7 +142,7 @@ def resolve_file(file_path: str, api_key: str, merge_base: str) -> bool:
 
     # 2. Check if file has any custom commits from fork
     if not file_has_custom_fork_commits(file_path, merge_base):
-        print(f"Auto-resolving {file_path}: No custom fork commits. Accepting upstream.")
+        print(f"Auto-resolving {file_path}: No custom fork commits (only formatting churn). Accepting upstream.")
         st = subprocess.run(["git", "status", "--porcelain", file_path], capture_output=True, text=True).stdout[:2]
         if st == "UD":
             subprocess.run(["git", "rm", file_path], check=True)
@@ -167,19 +171,81 @@ def resolve_file(file_path: str, api_key: str, merge_base: str) -> bool:
     except Exception:
         pass
 
+    # Hunk-by-hunk resolution
+    conflict_pattern = re.compile(r"<{7}[^\n]*\n(.*?)\n={7}\n(.*?)\n>{7}[^\n]*\n", re.DOTALL)
+    matches = list(conflict_pattern.finditer(content))
+
+    if matches:
+        print(f"Found {len(matches)} conflict hunk(s) in {file_path}. Resolving hunk-by-hunk...")
+        new_content = content
+        for match in reversed(matches):
+            head_code = match.group(1)
+            incoming_code = match.group(2)
+            start_idx = match.start()
+            end_idx = match.end()
+
+            lines_before = content[:start_idx].splitlines()[-15:]
+            context_before = "\n".join(lines_before)
+            lines_after = content[end_idx:].splitlines()[:15]
+            context_after = "\n".join(lines_after)
+
+            prompt = f"""You are an expert software engineer resolving a Git merge conflict hunk in QuantDinger.
+File path: {file_path}
+{divergences_text}
+Context before conflict:
+{context_before}
+
+Conflict hunk:
+<<<<<<< HEAD (local fork features)
+{head_code}
+======= (incoming upstream changes)
+{incoming_code}
+>>>>>>> upstream
+
+Context after conflict:
+{context_after}
+
+Instructions:
+1. Merge the HEAD block and upstream block cleanly and seamlessly.
+2. DO NOT discard or lose any of the local fork's features from HEAD (especially USDC, EUR, USD crypto spot support, quote asset resolution, or STRATEGY_DISTRIBUTED_BAR_ENABLED=false local runtime execution).
+3. Integrate the upstream improvements and fixes seamlessly.
+4. Output ONLY the replacement code that resolves this conflict hunk.
+5. Do NOT include conflict markers (<<<<<<<, =======, >>>>>>>).
+6. Do NOT include markdown code fences (like ```python or ```).
+7. Do NOT repeat the surrounding context before or after. Output ONLY the replacement code.
+"""
+            try:
+                resolved = call_gemini(prompt, api_key)
+                cleaned = clean_resolved_content(resolved)
+                if "<<<<<<<" in cleaned or ">>>>>>>" in cleaned:
+                    print(f"Warning: Gemini output still contains conflict markers in {file_path}!")
+                    return False
+                new_content = new_content[:start_idx] + cleaned + new_content[end_idx:]
+            except Exception as e:
+                print(f"Failed to resolve hunk in {file_path}: {e}")
+                return False
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        subprocess.run(["git", "add", file_path], check=True)
+        print(f"Successfully resolved and staged {file_path}")
+        return True
+
+    # Fallback: Full file resolution if hunk pattern did not match
     prompt = f"""You are an expert software engineer resolving Git merge conflicts for the application QuantDinger.
 File path: {file_path}
 
 Below is the complete file content containing Git merge conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`).
 
 Git Context:
-- The `HEAD` block contains the local fork's custom features and changes (e.g., USDC, EUR, and USD crypto spot market support for Binance/EU MiCA compliance, dynamic quote parsing in catalog sync and symbol search).
+- The `HEAD` block contains the local fork's custom features and changes (e.g., USDC, EUR, and USD crypto spot market support for Binance/EU MiCA compliance, base-asset position reconciliation, STRATEGY_DISTRIBUTED_BAR_ENABLED=false local runtime execution).
 - The incoming branch block (e.g. `upstream/main`) contains new upstream features, bug fixes, and refactorings.
 {divergences_text}
 
 Instructions:
 1. Merge both sides intelligently and cleanly.
-2. DO NOT discard or lose any of the local fork's custom features from HEAD (especially USDC/EUR support in catalog sync, market search, and static rows).
+2. DO NOT discard or lose any of the local fork's custom features from HEAD.
 3. Integrate the upstream improvements and fixes seamlessly.
 4. If imports, routes, function arguments, or templates are modified by both, merge them so that both features work without duplicate definitions or syntax errors.
 5. Remove all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).
