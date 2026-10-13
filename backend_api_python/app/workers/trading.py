@@ -46,7 +46,7 @@ class TradingWorker:
 
         self._grid_actor_mailbox = GridActorMailbox()
         self.distributed_bar_evaluation = str(
-            os.getenv("STRATEGY_DISTRIBUTED_BAR_ENABLED", "true")
+            os.getenv("STRATEGY_DISTRIBUTED_BAR_ENABLED", "false")
         ).strip().lower() in {"1", "true", "yes", "on"}
         self._lease_heartbeat = LeaseHeartbeat(self.worker_id, self.strategy_lease_seconds, self._lease_lost)
         self.executor.runtime_guard = self._lease_heartbeat.strategy_valid

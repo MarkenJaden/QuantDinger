@@ -79,3 +79,18 @@ It is consulted during automated upstream synchronization and CI validation (via
 
 
 
+
+---
+
+## 5. Local Trading Worker Execution vs. Distributed Bar Delegation
+
+- **Context & Motivation**:
+  - Upstream introduced experimental Kafka-based distributed strategy evaluation (`strategy-evaluator-worker`, `strategy-dispatcher-worker`) and set `STRATEGY_DISTRIBUTED_BAR_ENABLED=true` by default in `trading.py`.
+  - In a standalone or single-server deployment (Docker Compose / Coolify), there is no external market bar clock stream producing `MarketBarClosedV1` events into Kafka.
+  - When `STRATEGY_DISTRIBUTED_BAR_ENABLED` is `true`, `trading-worker` registers strategy event streams and delegates the strategy to `"strategy-evaluator-group" ("distributed_bar")`.
+  - As a result, `TradingExecutor` never starts the local strategy loop thread (`_run_strategy_loop`), does not acquire a lease in `qd_strategy_runtime_leases`, and never writes runtime heartbeats into `strategy_runs`.
+  - Consequently, `load_runtime_health` sees an expired heartbeat (>300s) and marks the strategy as **`"health": "offline"`**; furthermore, the strategy never evaluates closed bars or executes signals.
+  - **`backend_api_python/app/workers/trading.py`**:
+    - Default `STRATEGY_DISTRIBUTED_BAR_ENABLED` fallback changed from `"true"` to `"false"`.
+  - Ensures `trading-worker` acquires the runtime lease, starts the strategy in a dedicated execution thread, maintains continuous heartbeats, evaluates bars in real time, and automatically restores running strategies across container restarts.
+
