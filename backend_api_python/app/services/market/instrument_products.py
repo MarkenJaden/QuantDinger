@@ -52,7 +52,6 @@ def classify_instrument_product(
     exchange = str(exchange_id or "").strip().lower()
     mt = str(market_type or "spot").strip().lower()
     base = str(unified.get("base") or raw.get("baseCoin") or raw.get("baseCcy") or "").strip().upper()
-    canonical_symbol = str(symbol or unified.get("symbol") or "").strip().upper()
     native_id = str(instrument_id or unified.get("id") or raw.get("symbol") or raw.get("instId") or "").strip()
 
     explicit_equity = _explicit_equity_marker(raw)
@@ -133,10 +132,11 @@ def _explicit_equity_marker(raw: Mapping[str, Any]) -> bool:
             "businessType",
             "business_type",
             "marketRegion",
+            "tradfi_labels",
         )
     ).lower()
     return inst_category == "3" or has_named_underlying or any(
-        token in fields for token in ("stock", "xstock", "equity", "tradfi", "etf")
+        token in fields for token in ("stock", "xstock", "equity", "etf")
     )
 
 

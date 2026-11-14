@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
@@ -22,6 +23,7 @@ from .statistics import (
     parameter_heatmap,
     probability_of_backtest_overfitting,
     sample_sharpe,
+    training_score,
 )
 from .walk_forward import WalkForwardFold, build_walk_forward_plan
 
@@ -75,61 +77,124 @@ class StrategyEvolutionEngine:
             observations=walk_forward_context.get("observations"),
             warmup_bars=max(
                 int(walk_forward_context.get("warmupBars") or 0),
-                _parameter_lookback_bars(parameters),
+                parameter_lookback_bars(parameters),
             ),
             embargo_bars=config.embargo_bars,
         )
         sampler = ParameterSampler(parameters, seed=config.seed)
-        grid = sampler.grid(config.trials) if config.method == "grid" else []
-        trial_count = len(grid) if config.method == "grid" else config.trials
+        search_space_size = sampler.space_size()
+        constraint_rejections = 0
+        duplicate_rejections = 0
+        if config.method == "grid":
+            grid, grid_stats = sampler.grid_with_stats(
+                config.trials,
+                accept=lambda params: first_rejection(constraints, params) is None,
+            )
+            constraint_rejections = int(grid_stats["rejected"])
+        elif config.method == "random":
+            grid = sampler.stratified_candidates(min(config.trials, search_space_size))
+        else:
+            grid = []
+        trial_count = len(grid) if config.method in {"grid", "random"} else min(config.trials, search_space_size)
+        fallback_grid: list[dict[str, Any]] = []
+        if config.method != "grid" and search_space_size <= 100_000:
+            fallback_grid, _fallback_stats = sampler.grid_with_stats(
+                min(search_space_size, max(trial_count * 3, trial_count)),
+                accept=lambda params: first_rejection(constraints, params) is None,
+            )
+        fallback_index = 0
+        minimum_recommended_trials = _minimum_recommended_trials(
+            method=config.method,
+            parameter_count=len(parameters),
+            search_space_size=search_space_size,
+        )
         history: list[tuple[dict[str, Any], float]] = []
         trials: list[dict[str, Any]] = []
         seen: set[tuple[tuple[str, str], ...]] = set()
-        for trial_index in range(trial_count):
-            params = self._candidate(config, sampler, grid, history, trial_index)
+        attempts = 0
+        max_attempts = trial_count if config.method == "grid" else max(trial_count * 30, trial_count + 100)
+        while len(trials) < trial_count and attempts < max_attempts:
+            params = self._candidate(config, sampler, grid, history, len(trials))
+            attempts += 1
             identity = tuple(sorted((str(key), repr(value)) for key, value in params.items()))
             rejection = first_rejection(constraints, params)
-            if rejection is not None:
-                trial = self._skipped_trial(trial_index + 1, params, "parameterConstraint")
-                trial["constraint"] = rejection.metadata()
-            elif identity in seen:
-                trial = self._skipped_trial(trial_index + 1, params, "duplicateCandidate")
-            else:
-                seen.add(identity)
-                trial = self._evaluate_trial(
-                    trial_index + 1,
-                    params,
-                    plan.folds,
-                    config,
-                    commission,
-                    slippage,
-                    [float(row[1]) for row in history],
-                )
+            if rejection is not None or identity in seen:
+                if rejection is not None:
+                    constraint_rejections += 1
+                else:
+                    duplicate_rejections += 1
+                replacement = None
+                while fallback_index < len(fallback_grid):
+                    candidate = fallback_grid[fallback_index]
+                    fallback_index += 1
+                    candidate_identity = tuple(sorted((str(key), repr(value)) for key, value in candidate.items()))
+                    if candidate_identity not in seen:
+                        replacement = (candidate, candidate_identity)
+                        break
+                if replacement is None:
+                    continue
+                params, identity = replacement
+            seen.add(identity)
+            trial = self._evaluate_trial(
+                len(trials) + 1,
+                params,
+                plan.folds,
+                config,
+                commission,
+                slippage,
+                [float(row[1]) for row in history],
+            )
             trials.append(trial)
             if not trial["pruned"]:
-                history.append((params, float(trial["score"])))
+                history.append((params, float(trial["searchScore"])))
             if on_progress:
                 on_progress({
                     "phase": "search",
-                    "completed": trial_index + 1,
+                    "completed": len(trials),
                     "total": trial_count,
-                    "bestScore": max((row["score"] for row in trials if not row["pruned"]), default=0.0),
+                    "attempted": attempts,
+                    "bestScore": max((row["searchScore"] for row in trials if not row["pruned"]), default=0.0),
                 })
-        completed = sorted(
-            (row for row in trials if not row["pruned"] and row["components"].get("validationActivity", 0) > 0),
-            key=lambda row: row["score"],
+        searched = sorted(
+            (row for row in trials if not row["pruned"]),
+            key=lambda row: row["searchScore"],
             reverse=True,
         )
-        if not completed:
+        if not searched:
             raise StrategyEvolutionFailure(
                 "strategyEvolution.allTrialsPruned",
                 self._failure_diagnostics(trials),
             )
+        shortlist_size = min(
+            len(searched),
+            max(config.top_candidates * 2, int(math.ceil(math.sqrt(len(searched))))),
+        )
+        validation_eligible = [
+            row for row in searched
+            if float(row["components"].get("validationActivity") or 0.0) > 0
+        ]
+        if not validation_eligible:
+            raise StrategyEvolutionFailure(
+                "strategyEvolution.allTrialsPruned",
+                self._failure_diagnostics(trials),
+            )
+        completed = sorted(
+            validation_eligible[:shortlist_size],
+            key=lambda row: (
+                float(row["score"]),
+                -float(row["components"].get("maxDrawdown") or 0.0),
+                float(row["components"].get("validationActivity") or 0.0),
+                float(row["searchScore"]),
+            ),
+            reverse=True,
+        )
+        validation_diagnostics = self._rank_validation_candidates(completed)
         best = completed[0]
         blind_result = None
         if plan.blind_start and plan.blind_end:
             blind_result = self.evaluator(best["params"], plan.blind_start, plan.blind_end, commission, slippage)
         final_result = blind_result or best["validationResults"][-1]
+        blind_metrics = metric_snapshot(blind_result) if blind_result else None
         diagnostic_results = list(best["validationResults"])
         if blind_result:
             diagnostic_results.append(blind_result)
@@ -160,16 +225,43 @@ class StrategyEvolutionEngine:
             config.cost_multipliers,
         )
         robustness = self._robustness_grade(pbo, dsr, monte_carlo, cost_stress)
+        blind_passed = bool(
+            blind_metrics
+            and blind_metrics["activity"] > 0
+            and blind_metrics["return"] > 0
+        )
+        sample_sufficient = len(trials) >= min(minimum_recommended_trials, search_space_size)
+        validation_discrimination_sufficient = bool(
+            best["components"].get("validationActivity", 0) >= 2
+            and validation_diagnostics["distinctValidationBehaviors"] >= min(3, len(completed))
+            and validation_diagnostics["distinctValidationReturns"] >= min(2, len(completed))
+        )
+        recommended = bool(
+            sample_sufficient
+            and validation_discrimination_sufficient
+            and best["components"]["oosReturn"] > 0
+            and (blind_metrics is None or blind_passed)
+        )
+        selection_objective = "trainingCompositeThenOosReturn"
         return {
+            "resultVersion": 3,
             "status": "complete",
             "method": config.method,
             "config": asdict(config),
             "plan": {
                 **plan.metadata(),
-                "frequency": walk_forward_context.get("frequency"),
+                **{
+                    key: value
+                    for key, value in walk_forward_context.items()
+                    if key != "observations"
+                },
             },
             "summary": {
                 "bestScore": best["score"],
+                "bestSearchScore": best["searchScore"],
+                "selectionObjective": selection_objective,
+                "candidateScoreMetric": "oosCompoundedReturn",
+                "searchScoreMetric": "trainingCompositeScore",
                 "robustnessScore": robustness["score"],
                 "robustnessGrade": robustness["grade"],
                 "availableChecks": robustness["availableChecks"],
@@ -178,10 +270,28 @@ class StrategyEvolutionEngine:
                 "oosSharpe": best["components"]["oosSharpe"],
                 "maxDrawdown": best["components"]["maxDrawdown"],
                 "decayRate": best["components"]["decayRate"],
-                "completedTrials": len(completed),
+                "positiveValidationFolds": best["components"]["positiveValidationFolds"],
+                "validationFolds": best["components"]["validationFolds"],
+                "profitableFoldRate": best["components"]["profitableFoldRate"],
+                "blindReturn": blind_metrics["return"] if blind_metrics else None,
+                "blindActivity": blind_metrics["activity"] if blind_metrics else None,
+                "blindPassed": blind_passed,
+                "recommended": recommended,
+                "sampleSufficient": sample_sufficient,
+                "validationDiscriminationSufficient": validation_discrimination_sufficient,
+                **validation_diagnostics,
+                "requestedTrials": trial_count,
+                "evaluatedTrials": len(trials),
+                "candidateAttempts": len(trials) + constraint_rejections + duplicate_rejections,
+                "minimumRecommendedTrials": minimum_recommended_trials,
+                "searchSpaceSize": search_space_size,
+                "coveragePercent": round((len(trials) / search_space_size) * 100.0, 4) if search_space_size else 0.0,
+                "completedTrials": len(searched),
+                "validationShortlistTrials": len(completed),
                 "prunedTrials": sum(1 for row in trials if row["pruned"]),
-                "constraintRejectedTrials": sum(1 for row in trials if row.get("reason") == "parameterConstraint"),
-                "duplicateTrials": sum(1 for row in trials if row.get("reason") == "duplicateCandidate"),
+                "constraintRejectedTrials": constraint_rejections,
+                "overfitRejectedTrials": sum(1 for row in trials if row.get("reason") == "segmentedOverfit"),
+                "duplicateTrials": duplicate_rejections,
                 "actualBacktestRuns": self._evaluation_count(),
                 "elapsedSeconds": round(perf_counter() - started_at, 2),
             },
@@ -196,6 +306,16 @@ class StrategyEvolutionEngine:
                 "deflatedSharpe": dsr,
                 "monteCarlo": monte_carlo,
                 "costStress": cost_stress,
+            },
+            "selection": {
+                "objective": selection_objective,
+                "searchObjective": "trainingCompositeScore",
+                "validationObjective": "oosCompoundedReturn",
+                "overfitControl": "chronologicalHoldout",
+                "blindUsedForSelection": False,
+                "blindPassed": blind_passed,
+                "validationDiscriminationSufficient": validation_discrimination_sufficient,
+                "recommended": recommended,
             },
             "constraints": [constraint.metadata() for constraint in constraints],
         }
@@ -228,51 +348,66 @@ class StrategyEvolutionEngine:
             train_metrics.append(train_metric)
             validation_metrics.append(validation_metric)
             validation_results.append(validation_result)
-            partial_score, _ = composite_score(train_metrics, validation_metrics, config.weights)
+            quality_score, _partial_components = composite_score(train_metrics, validation_metrics, config.weights)
+            partial_score, _partial_training_components = training_score(train_metrics, config.weights)
             fold_rows.append({
                 **fold.metadata(),
                 "train": train_metric,
                 "validation": validation_metric,
                 "score": validation_metric["return"],
-                "selectionScore": partial_score,
+                "searchScore": partial_score,
+                "selectionScore": validation_metric["return"],
+                "qualityScore": quality_score,
             })
-            no_activity = (
-                train_metric.get("activity", 0) <= 0
-                and validation_metric.get("activity", 0) <= 0
-            )
+            no_training_activity = train_metric.get("activity", 0) <= 0
             invalid_metrics = train_metric.get("valid", 0) <= 0 or validation_metric.get("valid", 0) <= 0
             if invalid_metrics:
                 pruned = True
                 break
-            if config.auto_prune and no_activity:
+            if config.auto_prune and no_training_activity:
                 pruned = True
                 break
             if config.auto_prune and len(fold_rows) >= 2 and len(prior_scores) >= 6:
                 threshold = median(prior_scores) - 8.0
-                catastrophic = validation_metric["drawdown"] <= -70.0
+                catastrophic = train_metric["drawdown"] <= -70.0
                 if partial_score < threshold or catastrophic:
                     pruned = True
                     break
-        score, components = composite_score(train_metrics, validation_metrics, config.weights)
+        quality_score, components = composite_score(train_metrics, validation_metrics, config.weights)
+        search_score, training_components = training_score(train_metrics, config.weights)
+        score = components["oosReturn"]
+        positive_folds = sum(1 for row in validation_metrics if row["return"] > 0)
+        validation_folds = len(validation_metrics)
+        profitable_fold_rate = positive_folds / validation_folds if validation_folds else 0.0
+        components.update({
+            "qualityScore": quality_score,
+            "trainingScore": search_score,
+            "training": training_components,
+            "positiveValidationFolds": positive_folds,
+            "validationFolds": validation_folds,
+            "profitableFoldRate": round(profitable_fold_rate * 100.0, 2),
+        })
+        no_validation_activity = components.get("validationActivity", 0) <= 0
         reason = (
             "invalidMetrics"
             if any(row.get("valid", 0) <= 0 for row in train_metrics + validation_metrics)
-            else "noActivity"
-            if components.get("validationActivity", 0) <= 0
+            else "noValidationActivity"
+            if no_validation_activity
             else "autoPruned"
             if pruned
             else ""
         )
-        pruned = pruned or components.get("validationActivity", 0) <= 0
         return {
             "number": number,
             "params": params,
             "score": score,
+            "searchScore": search_score,
             "components": components,
             "folds": fold_rows,
             "pruned": pruned,
             "reason": reason,
             "validationResults": validation_results,
+            "validationSignature": self._validation_signature(validation_results),
         }
 
     @staticmethod
@@ -281,6 +416,7 @@ class StrategyEvolutionEngine:
             "number": number,
             "params": params,
             "score": 0.0,
+            "searchScore": 0.0,
             "components": {
                 "oosReturn": 0.0,
                 "oosSharpe": 0.0,
@@ -289,11 +425,16 @@ class StrategyEvolutionEngine:
                 "validationActivity": 0.0,
                 "activeValidationFolds": 0,
                 "activityEvidence": 0.0,
+                "qualityScore": 0.0,
+                "positiveValidationFolds": 0,
+                "validationFolds": 0,
+                "profitableFoldRate": 0.0,
             },
             "folds": [],
             "pruned": True,
             "reason": reason,
             "validationResults": [],
+            "validationSignature": "",
         }
 
     def _evaluation_count(self) -> int | None:
@@ -301,6 +442,21 @@ class StrategyEvolutionEngine:
         if isinstance(stats, dict):
             return int(stats.get("backtestRuns") or 0)
         return None
+
+    @staticmethod
+    def _segmented_overfit_reason(
+        validation_metrics: list[dict[str, float]],
+        components: dict[str, float],
+    ) -> str:
+        if len(validation_metrics) < 4 or components.get("oosReturn", 0.0) <= 0:
+            return ""
+        positive_returns = [row["return"] for row in validation_metrics if row["return"] > 0]
+        if len(positive_returns) < len(validation_metrics) / 2:
+            return "segmentedOverfit"
+        positive_total = sum(positive_returns)
+        if positive_total > 0 and max(positive_returns) / positive_total > 0.85:
+            return "segmentedOverfit"
+        return ""
 
     def _failure_diagnostics(self, trials: list[dict[str, Any]]) -> dict[str, Any]:
         reason_counts = Counter(str(row.get("reason") or "unknown") for row in trials)
@@ -319,10 +475,12 @@ class StrategyEvolutionEngine:
         dominant_reason = max(reason_counts, key=reason_counts.get) if reason_counts else "unknown"
         message_keys = {
             "noActivity": "strategyEvolution.failure.noValidationActivity",
+            "noValidationActivity": "strategyEvolution.failure.noValidationActivity",
             "parameterConstraint": "strategyEvolution.failure.parameterConstraints",
             "invalidMetrics": "strategyEvolution.failure.invalidMetrics",
             "duplicateCandidate": "strategyEvolution.failure.duplicateCandidates",
             "autoPruned": "strategyEvolution.failure.autoPruned",
+            "segmentedOverfit": "strategyEvolution.failure.segmentedOverfit",
         }
         return {
             "messageKey": message_keys.get(dominant_reason, "strategyEvolution.allTrialsPruned"),
@@ -362,25 +520,84 @@ class StrategyEvolutionEngine:
 
     @staticmethod
     def _candidate(config, sampler, grid, history, index):
-        if config.method == "grid":
+        if config.method in {"grid", "random"}:
             return grid[index % len(grid)]
         if config.method == "tpe":
+            if index > 0 and index % 5 == 0:
+                return sampler.random_candidate()
             return sampler.tpe_candidate(history)
         return sampler.random_candidate()
 
     @staticmethod
     def _public_trial(trial: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in trial.items() if key != "validationResults"}
+        private_keys = {"validationResults", "validationSignature"}
+        return {key: value for key, value in trial.items() if key not in private_keys}
 
     @staticmethod
     def _convergence(trials: list[dict[str, Any]]) -> list[dict[str, float | int | bool]]:
-        best = 0.0
+        best: float | None = None
         output = []
         for row in trials:
+            score = float(row.get("searchScore") or 0.0)
             if not row["pruned"]:
-                best = max(best, float(row["score"]))
-            output.append({"trial": row["number"], "score": row["score"], "best": round(best, 4), "pruned": row["pruned"]})
+                best = score if best is None else max(best, score)
+            output.append({
+                "trial": row["number"],
+                "score": round(score, 4),
+                "best": round(best if best is not None else score, 4),
+                "pruned": row["pruned"],
+            })
         return output
+
+    @staticmethod
+    def _validation_signature(results: list[dict[str, Any]]) -> str:
+        event_rows: list[tuple[str, ...]] = []
+        event_keys = (
+            "symbol",
+            "time",
+            "datetime",
+            "side",
+            "action",
+            "type",
+            "position_side",
+            "price",
+            "quantity",
+            "pnl",
+            "profit",
+            "reason",
+        )
+        metric_rows: list[tuple[float, float, float]] = []
+        for result in results:
+            events = result.get("executions") or result.get("closedTrades") or result.get("trades") or []
+            for event in events:
+                if isinstance(event, dict):
+                    event_rows.append(tuple(str(event.get(key) or "") for key in event_keys))
+            metrics = metric_snapshot(result)
+            metric_rows.append((
+                round(metrics["return"], 6),
+                round(metrics["drawdown"], 6),
+                round(metrics["activity"], 2),
+            ))
+        return repr((tuple(event_rows), tuple(metric_rows)))
+
+    @staticmethod
+    def _rank_validation_candidates(candidates: list[dict[str, Any]]) -> dict[str, int]:
+        return_counts = Counter(round(float(row["score"]), 4) for row in candidates)
+        behavior_counts = Counter(str(row.get("validationSignature") or "") for row in candidates)
+        previous_return: float | None = None
+        current_rank = 0
+        for index, row in enumerate(candidates, start=1):
+            return_bucket = round(float(row["score"]), 4)
+            if previous_return is None or return_bucket != previous_return:
+                current_rank = index
+                previous_return = return_bucket
+            row["rank"] = current_rank
+            row["validationTieCount"] = return_counts[return_bucket]
+            row["behaviorEquivalentCount"] = behavior_counts[str(row.get("validationSignature") or "")]
+        return {
+            "distinctValidationReturns": len(return_counts),
+            "distinctValidationBehaviors": len(behavior_counts),
+        }
 
     @staticmethod
     def _robustness_grade(pbo, dsr, monte_carlo, cost_stress) -> dict[str, Any]:
@@ -405,7 +622,15 @@ class StrategyEvolutionEngine:
         }
 
 
-def _parameter_lookback_bars(parameters: list[SearchParameter]) -> int:
+def _minimum_recommended_trials(*, method: str, parameter_count: int, search_space_size: int) -> int:
+    if method == "grid":
+        return min(search_space_size, 300)
+    if method == "random":
+        return min(search_space_size, max(64, parameter_count * 16))
+    return min(search_space_size, max(32, parameter_count * 16))
+
+
+def parameter_lookback_bars(parameters: list[SearchParameter]) -> int:
     tokens = ("period", "lookback", "window", "length", "bars")
     values = [
         int(parameter.maximum)
@@ -415,3 +640,6 @@ def _parameter_lookback_bars(parameters: list[SearchParameter]) -> int:
         and any(token in parameter.name.lower() for token in tokens)
     ]
     return max(values, default=0)
+
+
+_parameter_lookback_bars = parameter_lookback_bars

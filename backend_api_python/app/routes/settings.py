@@ -7,23 +7,43 @@ import os
 import re
 from flask import jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
-from app._version import APP_VERSION
 from app.markets.registry import market_options
 from app.utils.logger import get_logger
 from app.utils.config_loader import clear_config_cache
 from app.utils.auth import login_required, admin_required
 from app.services.settings.branding import build_brand_config
 from app.services.settings.env_file import read_env_file, write_env_file
+from app.utils.redaction import redact_secrets
 from app.services.settings.runtime import reload_runtime_env, refresh_runtime_services
+from app.services.settings.capabilities import get_feature_flags
+from app.utils.trading_venue_visibility import (
+    TRADING_VENUE_IDS,
+    enabled_trading_venues,
+    trading_venue_options,
+)
 
 logger = get_logger(__name__)
 
 settings_blp = Blueprint('settings', __name__)
 
-# These values are process-group security roots. They may be persisted through
-# the settings UI, but applying them to only one Gunicorn worker would make
-# authentication or credential decryption inconsistent until every worker has
-# restarted.
+# These process-group security roots must only be managed through deployment
+# environment configuration. Changing them from the settings API could
+# invalidate every active session or make stored credentials undecryptable.
+FIXED_TOKEN_IDENTIFIERS = frozenset({
+    'USDT_TRC20_CONTRACT',
+    'USDT_BEP20_CONTRACT',
+    'USDT_ERC20_CONTRACT',
+    'USDT_SOL_MINT',
+    'USDC_ERC20_CONTRACT',
+    'USDC_SOL_MINT',
+})
+
+DEPLOYMENT_ONLY_SETTINGS = frozenset({
+    'SECRET_KEY',
+    'CREDENTIAL_ENCRYPTION_KEY',
+    'QUANTDINGER_DEPLOYMENT_MODE',
+}) | FIXED_TOKEN_IDENTIFIERS
+
 STRATEGY_RUNTIME_SETTINGS = {
     'STRATEGY_MAX_ACTIVE',
     'STRATEGY_EVALUATOR_THREADS',
@@ -46,10 +66,30 @@ STRATEGY_RUNTIME_SETTINGS = {
     'BAR_IDLE_WAKE_INTERVAL_SEC',
 }
 
+TRADING_RUNTIME_SETTINGS = {
+    'MAKER_WAIT_SEC',
+    'MAKER_OFFSET_BPS',
+    'AGENT_LIVE_TRADING_ENABLED',
+}
+
+AGENT_RUNTIME_SETTINGS = {
+    'AGENT_JOBS_MAX_WORKERS',
+    'ENABLE_REFLECTION_WORKER',
+    'REFLECTION_WORKER_INTERVAL_SEC',
+    'REFLECTION_MIN_AGE_DAYS',
+    'REFLECTION_VALIDATE_LIMIT',
+    'ENABLE_CONFIDENCE_CALIBRATION',
+    'ENABLE_AI_ENSEMBLE',
+    'AI_ENSEMBLE_MODELS',
+    'AI_CALIBRATION_MARKETS',
+    'AI_CALIBRATION_LOOKBACK_DAYS',
+    'AI_CALIBRATION_MIN_SAMPLES',
+}
+
 RESTART_REQUIRED_SETTINGS = {
     'SECRET_KEY',
     'CREDENTIAL_ENCRYPTION_KEY',
-} | STRATEGY_RUNTIME_SETTINGS
+} | STRATEGY_RUNTIME_SETTINGS | TRADING_RUNTIME_SETTINGS | AGENT_RUNTIME_SETTINGS
 
 # ---------------------------------------------------------------
 # ---------------------------------------------------------------
@@ -59,32 +99,25 @@ RESTART_REQUIRED_SETTINGS = {
 # intentional — only put truly rarely changed knobs here so the basic tab stays
 # useful for day-to-day operators.
 ADVANCED_KEYS = {
-    # Bootstrap compatibility
-    'ADMIN_USER', 'ADMIN_PASSWORD',
     # AI tuning
     'OPENROUTER_TEMPERATURE',
     'LLM_MAX_TOKENS',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES', 'SEARCH_MAX_RESULTS',
     'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
-    'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SEARCH_BING_API_KEY', 'SERPAPI_KEYS',
+    'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SERPAPI_KEYS',
     'SEARCH_SEARXNG_ENGINES', 'SEARCH_SEARXNG_CATEGORIES', 'SEARCH_SEARXNG_LANGUAGE', 'SEARCH_SEARXNG_TIMEOUT',
     'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
     'ALPHA_VANTAGE_API_KEY', 'ALPHA_VANTAGE_BASE_URL', 'ALPHA_VANTAGE_TIMEOUT', 'ALPHA_VANTAGE_NEWS_LIMIT',
     'AI_CODE_GEN_MODEL', 'LLM_PROXY_URL', 'LLM_USE_SYSTEM_PROXY',
     'JEV_BASE_URL', 'JEV_MODEL', 'JEV_TIMEOUT_SECONDS', 'JEV_MIN_CONFIDENCE', 'AI_DECISION_TIMEOUT_SECONDS',
-    'EVENT_RADAR_JEV_MIN_CONFIDENCE', 'EVENT_RADAR_NEWS_LOOKBACK_DAYS', 'EVENT_RADAR_MAX_EVENTS',
-    'SEC_EDGAR_USER_AGENT',
     'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
-    # Trading internals
-    'ORDER_MODE', 'MAKER_WAIT_SEC',
-    'SPOT_CLOSE_SAFETY_RATIO', 'SPOT_OPEN_QUOTE_BUFFER',
+    # Data source internals
     'FINNHUB_API_KEY', 'FINNHUB_FREE_ONLY',
     'TRADING_ECONOMICS_CLIENT', 'TRADING_ECONOMICS_KEY',
     'COINGLASS_API_KEY', 'CRYPTOQUANT_API_KEY', 'TIINGO_API_KEY',
     'TWELVE_DATA_API_KEY', 'ADANOS_API_KEY',
-    # Agent gateway (operator-level)
-    'AGENT_JOBS_MAX_WORKERS',
-    'ENABLE_PENDING_ORDER_WORKER', 'DISABLE_RESTORE_RUNNING_STRATEGIES',
+    # Agent and AI runtime tuning
+    'AGENT_JOBS_MAX_WORKERS', 'AI_ENSEMBLE_MODELS',
     # Distributed strategy runtime tuning
     'SHARED_PUBLIC_MARKET_FALLBACK_TTL_SEC',
     'BAR_CLOSE_EVENT_GRACE_SEC', 'BAR_EVENT_FALLBACK_WAKE_SEC',
@@ -118,11 +151,60 @@ ADVANCED_KEYS = {
     'TRADING_ECONOMICS_BASE_URL', 'TRADING_ECONOMICS_TIMEOUT',
     'FRED_BASE_URL', 'FRED_TIMEOUT', 'BLS_BASE_URL', 'BLS_TIMEOUT', 'BEA_BASE_URL', 'BEA_TIMEOUT',
     # Brand internals
-    'BRAND_FAVICON_URL',
     'BRAND_LEGAL_USER_AGREEMENT_TEXT', 'BRAND_LEGAL_PRIVACY_POLICY_TEXT',
 }
 
 CONFIG_SCHEMA = {
+
+    'features': {
+        'title': 'settings.group.features',
+        'icon': 'control',
+        'order': -1,
+        'items': [
+            {
+                'key': 'BILLING_ENABLED',
+                'label': 'settings.field.BILLING_ENABLED',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.BILLING_ENABLED'
+            },
+            {
+                'key': 'MARKETPLACE_ENABLED',
+                'label': 'settings.field.MARKETPLACE_ENABLED',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.MARKETPLACE_ENABLED'
+            },
+            {
+                'key': 'ENABLE_REGISTRATION',
+                'label': 'settings.field.ENABLE_REGISTRATION',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.ENABLE_REGISTRATION'
+            },
+            {
+                'key': 'BROKER_ACCOUNTS_ENABLED',
+                'label': 'settings.field.BROKER_ACCOUNTS_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.BROKER_ACCOUNTS_ENABLED'
+            },
+            {
+                'key': 'LIVE_TRADING_ENABLED',
+                'label': 'settings.field.LIVE_TRADING_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.LIVE_TRADING_ENABLED'
+            },
+            {
+                'key': 'AGENT_GATEWAY_ENABLED',
+                'label': 'settings.field.AGENT_GATEWAY_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.AGENT_GATEWAY_ENABLED'
+            },
+        ]
+    },
 
     # Frontend reads these via /api/settings/brand-config (no auth) so logos,
     # social links, version label and legal modals can be rebranded without
@@ -307,17 +389,10 @@ CONFIG_SCHEMA = {
     },
 
     'auth': {
-        'title': 'Security & Authentication',
-        'icon': 'lock',
+        'title': 'settings.group.auth',
+        'icon': 'user',
         'order': 1,
         'items': [
-            {
-                'key': 'SECRET_KEY',
-                'label': 'Secret Key',
-                'type': 'password',
-                'default': '',
-                'description': 'Required JWT signing key (minimum 10 bytes for legacy compatibility; 32+ random bytes recommended)'
-            },
             {
                 'key': 'ADMIN_USER',
                 'label': 'Admin Username',
@@ -347,6 +422,13 @@ CONFIG_SCHEMA = {
         'icon': 'robot',
         'order': 2,
         'items': [
+            {
+                'key': 'JEV_ENABLED',
+                'label': 'settings.field.JEV_ENABLED',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.JEV_ENABLED'
+            },
             {
                 'key': 'JEV_API_KEY',
                 'label': 'settings.field.JEV_API_KEY',
@@ -390,63 +472,6 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': 0.55,
                 'description': 'settings.desc.JEV_MIN_CONFIDENCE'
-            },
-            {
-                'key': 'EVENT_RADAR_ENABLED',
-                'label': 'settings.field.EVENT_RADAR_ENABLED',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'settings.desc.EVENT_RADAR_ENABLED'
-            },
-            {
-                'key': 'EVENT_RADAR_JEV_MIN_CONFIDENCE',
-                'label': 'settings.field.EVENT_RADAR_JEV_MIN_CONFIDENCE',
-                'type': 'number',
-                'default': 0.65,
-                'description': 'settings.desc.EVENT_RADAR_JEV_MIN_CONFIDENCE'
-            },
-            {
-                'key': 'EVENT_RADAR_NEWS_LOOKBACK_DAYS',
-                'label': 'settings.field.EVENT_RADAR_NEWS_LOOKBACK_DAYS',
-                'type': 'number',
-                'default': 2,
-                'description': 'settings.desc.EVENT_RADAR_NEWS_LOOKBACK_DAYS'
-            },
-            {
-                'key': 'EVENT_RADAR_MAX_EVENTS',
-                'label': 'settings.field.EVENT_RADAR_MAX_EVENTS',
-                'type': 'number',
-                'default': 8,
-                'description': 'settings.desc.EVENT_RADAR_MAX_EVENTS'
-            },
-            {
-                'key': 'EVENT_RADAR_CRYPTO_RSS_ENABLED',
-                'label': 'settings.field.EVENT_RADAR_CRYPTO_RSS_ENABLED',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'settings.desc.EVENT_RADAR_CRYPTO_RSS_ENABLED'
-            },
-            {
-                'key': 'EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED',
-                'label': 'settings.field.EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'settings.desc.EVENT_RADAR_YAHOO_FINANCE_RSS_ENABLED'
-            },
-            {
-                'key': 'EVENT_RADAR_SEC_EDGAR_ENABLED',
-                'label': 'settings.field.EVENT_RADAR_SEC_EDGAR_ENABLED',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'settings.desc.EVENT_RADAR_SEC_EDGAR_ENABLED'
-            },
-            {
-                'key': 'SEC_EDGAR_USER_AGENT',
-                'label': 'settings.field.SEC_EDGAR_USER_AGENT',
-                'type': 'text',
-                'default': '',
-                'required': False,
-                'description': 'settings.desc.SEC_EDGAR_USER_AGENT'
             },
             {
                 'key': 'LLM_PROVIDER',
@@ -715,6 +740,21 @@ CONFIG_SCHEMA = {
                 'description': 'Optional. Override provider base URL (e.g. Azure endpoint)',
                 'group': 'litellm'
             },
+            {
+                'key': 'ENABLE_AI_ENSEMBLE',
+                'label': 'settings.field.ENABLE_AI_ENSEMBLE',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.ENABLE_AI_ENSEMBLE'
+            },
+            {
+                'key': 'AI_ENSEMBLE_MODELS',
+                'label': 'settings.field.AI_ENSEMBLE_MODELS',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'settings.desc.AI_ENSEMBLE_MODELS'
+            },
             # Common settings
             {
                 'key': 'OPENROUTER_TEMPERATURE',
@@ -738,78 +778,34 @@ CONFIG_SCHEMA = {
                 'required': False,
                 'description': 'Multi-timeframe consensus for fast AI analysis. Comma-separated, e.g. "1D,4H"'
             },
-            {
-                'key': 'LLM_PROXY_URL',
-                'label': 'LLM Proxy URL',
-                'type': 'text',
-                'default': '',
-                'required': False,
-                'description': 'Optional dedicated proxy for LLM provider requests. Leave empty for direct LLM access; PROXY_URL is reserved for market data and exchange APIs.'
-            },
-            {
-                'key': 'LLM_USE_SYSTEM_PROXY',
-                'label': 'Use System Proxy for LLM',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'When enabled, LLM requests inherit HTTP_PROXY / HTTPS_PROXY / ALL_PROXY. Keep disabled unless the configured system proxy is reachable from this backend.'
-            },
         ]
     },
 
     'trading': {
-        'title': 'Live Trading',
+        'title': 'settings.group.trading',
         'icon': 'stock',
         'order': 3,
         'items': [
             {
-                'key': 'ORDER_MODE',
-                'label': 'Order Execution Mode',
-                'type': 'select',
-                'options': ['market', 'maker'],
-                'default': 'market',
-                'description': 'market: Market order (instant fill, recommended), maker: Limit order first (lower fees but may not fill)'
+                'key': 'AGENT_LIVE_TRADING_ENABLED',
+                'label': 'settings.field.AGENT_LIVE_TRADING_ENABLED',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.AGENT_LIVE_TRADING_ENABLED'
             },
             {
                 'key': 'MAKER_WAIT_SEC',
-                'label': 'Limit Order Wait (sec)',
+                'label': 'settings.field.MAKER_WAIT_SEC',
                 'type': 'number',
                 'default': '10',
-                'description': 'Wait time for limit order fill before switching to market order'
+                'description': 'settings.desc.MAKER_WAIT_SEC'
             },
             {
-                'key': 'SPOT_CLOSE_SAFETY_RATIO',
-                'label': 'Spot Close Safety Ratio',
+                'key': 'MAKER_OFFSET_BPS',
+                'label': 'settings.field.MAKER_OFFSET_BPS',
                 'type': 'number',
-                'default': '1.0',
-                'description': 'When closing spot long, sell qty is capped to (exchange free base × this ratio), then floored to lot step. Base-asset fees are already deducted from strategy inventory; lower only if a venue still rejects full closes (valid range 0.9–1.0).'
-            },
-            {
-                'key': 'SPOT_OPEN_QUOTE_BUFFER',
-                'label': 'Spot Open Quote Buffer',
-                'type': 'number',
-                'default': '0.995',
-                'description': 'Fraction of USDT/notional used on spot open (reserve headroom for buy fees). Example 0.995 uses 99.5% of allocated quote (valid range 0.9–1.0).'
-            },
-            {
-                'key': 'ALLOW_LOCAL_DESKTOP_BROKERS',
-                'label': 'Allow IBKR (local desktop broker)',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Disable on a multi-tenant SaaS deployment so users see a clear "broker not supported" message instead of broken connect flows. Crypto exchange API keys are unaffected.'
-            },
-            {
-                'key': 'ENABLE_PENDING_ORDER_WORKER',
-                'label': 'Enable Pending Order Worker',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Background worker that syncs broker positions, manages pending limit orders, and triggers strategy auto-stop on fatal errors. Disable only when running multiple API replicas where another node already runs the worker.'
-            },
-            {
-                'key': 'DISABLE_RESTORE_RUNNING_STRATEGIES',
-                'label': 'Disable Auto-Restore Strategies on Boot',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'When False, strategies running before a server restart are automatically resumed. Set to True only if you want to inspect state on next boot before any strategy resumes trading.'
+                'default': '2',
+                'description': 'settings.desc.MAKER_OFFSET_BPS'
             },
         ]
     },
@@ -820,10 +816,17 @@ CONFIG_SCHEMA = {
         'order': 3.25,
         'items': [
             {
+                'key': 'AGENT_JOBS_MAX_WORKERS',
+                'label': 'settings.field.AGENT_JOBS_MAX_WORKERS',
+                'type': 'number',
+                'default': '4',
+                'description': 'settings.desc.AGENT_JOBS_MAX_WORKERS'
+            },
+            {
                 'key': 'STRATEGY_MAX_ACTIVE',
                 'label': 'settings.field.STRATEGY_MAX_ACTIVE',
                 'type': 'number',
-                'default': '100000',
+                'default': '3000',
                 'description': 'settings.desc.STRATEGY_MAX_ACTIVE',
             },
             {
@@ -877,6 +880,15 @@ CONFIG_SCHEMA = {
                 'options': market_options(),
                 'description': 'Markets exposed to research, strategy, market data, Agent API, and live-trading entry points. Saved as ENABLED_MARKETS in .env for backward compatibility. Empty = whitelist disabled and legacy SHOW_* flags apply.'
             },
+            {
+                'key': 'ENABLED_TRADING_VENUES',
+                'label': 'Enabled Brokers and Exchanges',
+                'type': 'venue_multiselect',
+                'default': ','.join(TRADING_VENUE_IDS),
+                'options': trading_venue_options(),
+                'required': False,
+                'description': 'Brokers and exchanges exposed to account management, quick trading, strategy deployment, and order execution. An empty selection disables every live trading venue.'
+            },
         ]
     },
 
@@ -885,17 +897,6 @@ CONFIG_SCHEMA = {
         'icon': 'database',
         'order': 4,
         'items': [
-            {
-                'key': 'PROFESSIONAL_REPORT_DATA_TIER',
-                'label': 'Professional Report Data Tier',
-                'type': 'select',
-                'default': 'community',
-                'options': [
-                    {'value': 'community', 'label': 'Community / low-cost'},
-                    {'value': 'professional', 'label': 'Professional'},
-                ],
-                'description': 'Select the source tier declared in professional reports. Community remains the safe default and still uses every configured active fallback.'
-            },
             {
                 'key': 'PROFESSIONAL_REPORT_RISK_BUDGET_PCT',
                 'label': 'Risk Budget per Trade (%)',
@@ -934,6 +935,144 @@ CONFIG_SCHEMA = {
                 'description': 'Keep enabled for free Finnhub plans. When enabled, paid-only Finnhub endpoints such as Economic Calendar and Social Sentiment are not called.'
             },
             {
+                'key': 'FINNHUB_TIMEOUT',
+                'label': 'settings.field.FINNHUB_TIMEOUT',
+                'type': 'number',
+                'default': '10',
+                'description': 'settings.desc.FINNHUB_TIMEOUT'
+            },
+            {
+                'key': 'SEC_USER_AGENT',
+                'label': 'settings.field.SEC_USER_AGENT',
+                'type': 'text',
+                'default': 'QuantDinger/5.0 open-source-research support@your-domain.com',
+                'required': False,
+                'description': 'settings.desc.SEC_USER_AGENT'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_API_KEY',
+                'label': 'Alpha Vantage API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://www.alphavantage.co/support/#api-key',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'settings.desc.ALPHA_VANTAGE_API_KEY'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_BASE_URL',
+                'label': 'Alpha Vantage Base URL',
+                'type': 'text',
+                'default': 'https://www.alphavantage.co/query',
+                'link': 'https://www.alphavantage.co/documentation/',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'settings.desc.ALPHA_VANTAGE_BASE_URL'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_TIMEOUT',
+                'label': 'Alpha Vantage Timeout (sec)',
+                'type': 'number',
+                'default': '12',
+                'description': 'settings.desc.ALPHA_VANTAGE_TIMEOUT'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_NEWS_LIMIT',
+                'label': 'Alpha Vantage News Limit',
+                'type': 'number',
+                'default': '20',
+                'description': 'settings.desc.ALPHA_VANTAGE_NEWS_LIMIT'
+            },
+            {
+                'key': 'FRED_API_KEY',
+                'label': 'FRED API Key',
+                'type': 'password',
+                'default': '',
+                'required': False,
+                'link': 'https://fred.stlouisfed.org/docs/api/api_key.html',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'FRED key for stable US macro time series such as rates, CPI, unemployment, payrolls and financial conditions.'
+            },
+            {
+                'key': 'FRED_BASE_URL',
+                'label': 'FRED Base URL',
+                'type': 'text',
+                'default': 'https://api.stlouisfed.org/fred',
+                'link': 'https://fred.stlouisfed.org/docs/api/fred/',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'FRED API endpoint. Change only when using a proxy.'
+            },
+            {
+                'key': 'FRED_TIMEOUT',
+                'label': 'FRED Timeout (sec)',
+                'type': 'number',
+                'default': '10',
+                'description': 'Timeout for FRED macro time-series requests.'
+            },
+            {
+                'key': 'COINGLASS_API_KEY',
+                'label': 'Coinglass API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://docs.coinglass.com/reference/getting-started-with-your-api',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Coinglass API key for crypto derivatives, funding rate, long/short ratio, and exchange flow data. Open the official docs to view signup and key management instructions.'
+            },
+            {
+                'key': 'CRYPTOQUANT_API_KEY',
+                'label': 'CryptoQuant API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://cryptoquant.com/docs',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'CryptoQuant API key for on-chain and stablecoin flow metrics used in crypto AI analysis. API access is tied to paid plans; see the official docs for activation details.'
+            },
+            {
+                'key': 'TIINGO_API_KEY',
+                'label': 'Tiingo API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://www.tiingo.com/account/api/token',
+                'link_text': 'settings.link.getToken',
+                'description': 'Tiingo API key for Forex/Metals data'
+            },
+            {
+                'key': 'TIINGO_TIMEOUT',
+                'label': 'settings.field.TIINGO_TIMEOUT',
+                'type': 'number',
+                'default': '10',
+                'description': 'settings.desc.TIINGO_TIMEOUT'
+            },
+            {
+                'key': 'TWELVE_DATA_API_KEY',
+                'label': 'Twelve Data API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://twelvedata.com/apikey',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Twelve Data API key for CN/HK stock K-lines (free 800 credits/day)'
+            },
+            {
+                'key': 'CRYPTO_PUBLIC_TIMEOUT',
+                'label': 'settings.field.CRYPTO_PUBLIC_TIMEOUT',
+                'type': 'number',
+                'default': '10000',
+                'description': 'settings.desc.CRYPTO_PUBLIC_TIMEOUT'
+            },
+            {
+                'key': 'AKSHARE_TIMEOUT',
+                'label': 'settings.field.AKSHARE_TIMEOUT',
+                'type': 'number',
+                'default': '30',
+                'description': 'settings.desc.AKSHARE_TIMEOUT'
+            },
+        ]
+    },
+
+    'macro_tools': {
+        'title': 'settings.group.macro_tools',
+        'icon': 'global',
+        'order': 4.1,
+        'items': [
+            {
                 'key': 'TRADING_ECONOMICS_CLIENT',
                 'label': 'Trading Economics Client',
                 'type': 'text',
@@ -968,32 +1107,6 @@ CONFIG_SCHEMA = {
                 'description': 'Timeout for economic calendar requests.'
             },
             {
-                'key': 'FRED_API_KEY',
-                'label': 'FRED API Key',
-                'type': 'password',
-                'default': '',
-                'required': False,
-                'link': 'https://fred.stlouisfed.org/docs/api/api_key.html',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'FRED key for stable US macro time series such as rates, CPI, unemployment, payrolls and financial conditions.'
-            },
-            {
-                'key': 'FRED_BASE_URL',
-                'label': 'FRED Base URL',
-                'type': 'text',
-                'default': 'https://api.stlouisfed.org/fred',
-                'link': 'https://fred.stlouisfed.org/docs/api/fred/',
-                'link_text': 'settings.link.viewDocs',
-                'description': 'FRED API endpoint. Change only when using a proxy.'
-            },
-            {
-                'key': 'FRED_TIMEOUT',
-                'label': 'FRED Timeout (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Timeout for FRED macro time-series requests.'
-            },
-            {
                 'key': 'BLS_API_KEY',
                 'label': 'BLS API Key',
                 'type': 'password',
@@ -1019,68 +1132,14 @@ CONFIG_SCHEMA = {
                 'default': '10',
                 'description': 'Timeout for BLS official macro series requests.'
             },
-            {
-                'key': 'BEA_API_KEY',
-                'label': 'BEA API Key',
-                'type': 'password',
-                'default': '',
-                'required': False,
-                'link': 'https://apps.bea.gov/API/signup/',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'BEA key for official GDP, income, consumption and national accounts data.'
-            },
-            {
-                'key': 'BEA_BASE_URL',
-                'label': 'BEA Base URL',
-                'type': 'text',
-                'default': 'https://apps.bea.gov/api/data',
-                'link': 'https://apps.bea.gov/api/_pdf/bea_web_service_api_user_guide.pdf',
-                'link_text': 'settings.link.viewDocs',
-                'description': 'BEA API endpoint. Change only when using a proxy.'
-            },
-            {
-                'key': 'BEA_TIMEOUT',
-                'label': 'BEA Timeout (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Timeout for BEA official macro data requests.'
-            },
-            {
-                'key': 'COINGLASS_API_KEY',
-                'label': 'Coinglass API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://docs.coinglass.com/reference/getting-started-with-your-api',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Coinglass API key for crypto derivatives, funding rate, long/short ratio, and exchange flow data. Open the official docs to view signup and key management instructions.'
-            },
-            {
-                'key': 'CRYPTOQUANT_API_KEY',
-                'label': 'CryptoQuant API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://cryptoquant.com/docs',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'CryptoQuant API key for on-chain and stablecoin flow metrics used in crypto AI analysis. API access is tied to paid plans; see the official docs for activation details.'
-            },
-            {
-                'key': 'TIINGO_API_KEY',
-                'label': 'Tiingo API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://www.tiingo.com/account/api/token',
-                'link_text': 'settings.link.getToken',
-                'description': 'Tiingo API key for Forex/Metals data'
-            },
-            {
-                'key': 'TWELVE_DATA_API_KEY',
-                'label': 'Twelve Data API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://twelvedata.com/apikey',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Twelve Data API key for CN/HK stock K-lines (free 800 credits/day)'
-            },
+        ]
+    },
+
+    'market_intelligence': {
+        'title': 'settings.group.market_intelligence',
+        'icon': 'radar-chart',
+        'order': 4.2,
+        'items': [
             {
                 'key': 'ADANOS_API_KEY',
                 'label': 'Adanos API Key',
@@ -1093,9 +1152,15 @@ CONFIG_SCHEMA = {
             {
                 'key': 'ADANOS_SENTIMENT_SOURCE',
                 'label': 'Adanos Sentiment Source',
-                'type': 'text',
+                'type': 'select',
+                'options': [
+                    {'value': 'reddit', 'label': 'Reddit'},
+                    {'value': 'x', 'label': 'X (Twitter)'},
+                    {'value': 'news', 'label': 'News'},
+                    {'value': 'polymarket', 'label': 'Polymarket'},
+                ],
                 'default': 'reddit',
-                'description': 'Sentiment source channel (reddit, etc.). See Adanos docs for valid values.'
+                'description': 'Select the Adanos sentiment channel used for US-stock sentiment snapshots.'
             },
             {
                 'key': 'ADANOS_API_BASE_URL',
@@ -1116,7 +1181,7 @@ CONFIG_SCHEMA = {
                 'key': 'SEARCH_PROVIDER',
                 'label': 'Search Provider',
                 'type': 'select',
-                'options': ['tavily', 'searxng', 'gdelt', 'serpapi', 'google', 'bing', 'duckduckgo', 'none'],
+                'options': ['tavily', 'searxng', 'gdelt', 'serpapi', 'google', 'duckduckgo', 'none'],
                 'default': 'tavily',
                 'description': 'Primary news/web search provider used by AI analysis. QuantDinger falls back to configured providers, then GDELT and DuckDuckGo when available'
             },
@@ -1183,15 +1248,6 @@ CONFIG_SCHEMA = {
                 'description': 'Google Programmable Search Engine ID'
             },
             {
-                'key': 'SEARCH_BING_API_KEY',
-                'label': 'Bing Search API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://portal.azure.com/',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Microsoft Bing Web Search API key'
-            },
-            {
                 'key': 'SEARCH_SEARXNG_ENGINES',
                 'label': 'SearXNG Engines',
                 'type': 'text',
@@ -1235,38 +1291,6 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': '10',
                 'description': 'Default maximum GDELT article count used by fallback news/event search.'
-            },
-            {
-                'key': 'ALPHA_VANTAGE_API_KEY',
-                'label': 'Alpha Vantage API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://www.alphavantage.co/support/#api-key',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Optional low-cost company news and sentiment source using Alpha Vantage NEWS_SENTIMENT.'
-            },
-            {
-                'key': 'ALPHA_VANTAGE_BASE_URL',
-                'label': 'Alpha Vantage Base URL',
-                'type': 'text',
-                'default': 'https://www.alphavantage.co/query',
-                'link': 'https://www.alphavantage.co/documentation/',
-                'link_text': 'settings.link.viewDocs',
-                'description': 'Alpha Vantage API endpoint for NEWS_SENTIMENT and related market-data functions.'
-            },
-            {
-                'key': 'ALPHA_VANTAGE_TIMEOUT',
-                'label': 'Alpha Vantage Timeout (sec)',
-                'type': 'number',
-                'default': '12',
-                'description': 'Timeout for Alpha Vantage company news and sentiment requests.'
-            },
-            {
-                'key': 'ALPHA_VANTAGE_NEWS_LIMIT',
-                'label': 'Alpha Vantage News Limit',
-                'type': 'number',
-                'default': '20',
-                'description': 'Maximum NEWS_SENTIMENT feed items requested per company-news lookup.'
             },
         ]
     },
@@ -1359,39 +1383,12 @@ CONFIG_SCHEMA = {
         ]
     },
 
-    # ==================== 7. AI Agent ====================
+    # ==================== 7. Analysis validation ====================
     'agent': {
-        'title': 'AI Agent',
+        'title': 'settings.group.agent',
         'icon': 'experiment',
         'order': 7,
         'items': [
-            # Agent Gateway (/api/agent/v1) deployment knobs
-            {
-                'key': 'AGENT_LIVE_TRADING_ENABLED',
-                'label': 'Agent Live Trading',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Hard kill switch for live trading from agent tokens. When False, T-class agent calls always record paper orders even if the token allows live mode.'
-            },
-            {
-                'key': 'QUANTDINGER_DEPLOYMENT_MODE',
-                'label': 'Deployment Mode',
-                'type': 'select',
-                'options': [
-                    {'value': '', 'label': 'Single-tenant / self-hosted'},
-                    {'value': 'saas', 'label': 'SaaS / hosted (multi-tenant)'},
-                    {'value': 'hosted', 'label': 'Hosted (alias of saas)'},
-                ],
-                'default': '',
-                'description': 'Set to "saas" on multi-tenant hosted instances. Users self-manage Agent Tokens in Profile; T scope is allowed with in-app risk disclosure. Live trading still requires AGENT_LIVE_TRADING_ENABLED.'
-            },
-            {
-                'key': 'AGENT_JOBS_MAX_WORKERS',
-                'label': 'Agent Jobs Max Workers',
-                'type': 'number',
-                'default': '4',
-                'description': 'Thread pool size for async agent jobs (backtests, experiment pipelines).'
-            },
             {
                 'key': 'ENABLE_REFLECTION_WORKER',
                 'label': 'Enable Auto Reflection',
@@ -1426,20 +1423,6 @@ CONFIG_SCHEMA = {
                 'type': 'boolean',
                 'default': 'False',
                 'description': 'Adjust confidence by historical accuracy in each bucket'
-            },
-            {
-                'key': 'ENABLE_AI_ENSEMBLE',
-                'label': 'Enable Multi-Model Voting',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Use 2-3 models and majority vote for more stable decisions'
-            },
-            {
-                'key': 'AI_ENSEMBLE_MODELS',
-                'label': 'Ensemble Models',
-                'type': 'text',
-                'default': 'openai/gpt-5.4,openai/gpt-4o-mini',
-                'description': 'Comma-separated model IDs for ensemble voting'
             },
             {
                 'key': 'AI_CALIBRATION_MARKETS',
@@ -1477,6 +1460,21 @@ CONFIG_SCHEMA = {
                 'required': False,
                 'description': 'Proxy URL for market data, exchange and broker APIs. LLM provider calls are direct by default; use LLM Proxy URL only when an LLM provider must go through a proxy.'
             },
+            {
+                'key': 'LLM_PROXY_URL',
+                'label': 'settings.field.LLM_PROXY_URL',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'settings.desc.LLM_PROXY_URL'
+            },
+            {
+                'key': 'LLM_USE_SYSTEM_PROXY',
+                'label': 'settings.field.LLM_USE_SYSTEM_PROXY',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.LLM_USE_SYSTEM_PROXY'
+            },
         ]
     },
 
@@ -1485,13 +1483,6 @@ CONFIG_SCHEMA = {
         'icon': 'safety',
         'order': 10,
         'items': [
-            {
-                'key': 'ENABLE_REGISTRATION',
-                'label': 'Enable Registration',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Allow new users to register accounts'
-            },
             {
                 'key': 'MFA_ENABLED',
                 'label': 'Enable Authenticator App MFA',
@@ -1649,10 +1640,10 @@ CONFIG_SCHEMA = {
             },
             {
                 'key': 'VERIFICATION_CODE_IP_HOURLY_LIMIT',
-                'label': 'Verification Code IP Hourly Limit',
+                'label': 'settings.field.VERIFICATION_CODE_IP_HOURLY_LIMIT',
                 'type': 'number',
                 'default': '10',
-                'description': 'Maximum verification codes one IP may request per hour.'
+                'description': 'settings.desc.VERIFICATION_CODE_IP_HOURLY_LIMIT'
             },
             {
                 'key': 'VERIFICATION_CODE_MAX_ATTEMPTS',
@@ -1690,14 +1681,6 @@ CONFIG_SCHEMA = {
         'icon': 'dollar',
         'order': 11,
         'items': [
-            {
-                'key': 'BILLING_ENABLED',
-                'label': 'Enable Billing',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Enable billing system. Users need credits to use certain features'
-            },
-
             # ===== USDT Pay (v3.0.6+: one fixed address per chain + amount-suffix matching) =====
             # Model: each chain has a single receiving address. Orders are
             # disambiguated by a unique amount suffix in the low decimals
@@ -2006,13 +1989,6 @@ CONFIG_SCHEMA = {
                 'description': 'settings.desc.BILLING_COST_AI_DECISION_FILTER'
             },
             {
-                'key': 'BILLING_COST_EVENT_RADAR',
-                'label': 'settings.field.BILLING_COST_EVENT_RADAR',
-                'type': 'number',
-                'default': '5',
-                'description': 'settings.desc.BILLING_COST_EVENT_RADAR'
-            },
-            {
                 'key': 'MARKETPLACE_PLATFORM_FEE_RATE',
                 'label': 'Marketplace Platform Fee Rate',
                 'type': 'text',
@@ -2084,6 +2060,9 @@ def _schema_with_advanced_flags():
         for item in group.get('items', []):
             new_item = dict(item)
             new_item['is_advanced'] = item['key'] in ADVANCED_KEYS
+            if item['key'] in FIXED_TOKEN_IDENTIFIERS:
+                new_item['readonly'] = True
+                new_item['source'] = 'deployment'
             items.append(new_item)
         annotated[group_key] = {**group, 'items': items}
     return annotated
@@ -2096,7 +2075,11 @@ def _effective_schema(env_values=None):
     dotenv file because changing them from a running application cannot be
     applied safely or atomically.
     """
-    return _schema_with_advanced_flags()
+    values = env_values if env_values is not None else read_env_file()
+    schema = _schema_with_advanced_flags()
+    if not get_feature_flags(values)['billing_enabled']:
+        schema.pop('billing', None)
+    return schema
 
 
 @settings_blp.route('/schema', methods=['GET'])
@@ -2107,7 +2090,7 @@ def get_settings_schema():
     return jsonify({
         'code': 1,
         'msg': 'success',
-        'data': _effective_schema()
+        'data': _effective_schema(read_env_file())
     })
 
 
@@ -2116,10 +2099,14 @@ def get_settings_schema():
 def get_public_config():
     """Return non-sensitive config values needed by frontend widgets."""
     from app.config.data_sources import CryptoPublicConfig
+    env_values = read_env_file()
+    feature_flags = get_feature_flags(env_values)
     return jsonify({
         'code': 1,
         'data': {
             'crypto_public_default_exchange': (CryptoPublicConfig.DEFAULT_EXCHANGE or 'binance').lower(),
+            'enabled_trading_venues': sorted(enabled_trading_venues(env_values)),
+            **feature_flags,
         }
     })
 
@@ -2138,7 +2125,7 @@ def get_brand_config():
     return jsonify({
         'code': 1,
         'msg': 'success',
-        'data': build_brand_config(APP_VERSION)
+        'data': build_brand_config()
     })
 
 
@@ -2213,8 +2200,26 @@ def save_settings():
     """Save settings to .env (admin only)."""
     try:
         data = request.get_json()
-        if not data:
-            return jsonify({'code': 0, 'msg': 'Invalid request payload'})
+        if not isinstance(data, dict) or not data:
+            return jsonify({'code': 0, 'msg': 'Invalid request payload'}), 400
+
+        requested_keys = {
+            key
+            for group_values in data.values()
+            if isinstance(group_values, dict)
+            for key in group_values
+        }
+        blocked_keys = sorted(DEPLOYMENT_ONLY_SETTINGS.intersection(requested_keys))
+        if blocked_keys:
+            logger.warning(
+                "Rejected settings API update for deployment-only keys: %s",
+                ', '.join(blocked_keys),
+            )
+            return jsonify({
+                'code': 0,
+                'msg': 'settings.deploymentOnlySetting',
+                'data': {'keys': blocked_keys},
+            }), 400
         
         current_env = read_env_file()
         effective_schema = _effective_schema(current_env)
@@ -2450,13 +2455,10 @@ def test_connection():
         service = data.get('service')
         
         if service == 'openrouter':
-            from app.services.llm import LLMService
-            llm = LLMService()
-            result = llm.test_connection()
-            if result:
-                return jsonify({'code': 1, 'msg': 'OpenRouter connection successful'})
-            else:
-                return jsonify({'code': 0, 'msg': 'OpenRouter connection failed'})
+            from app.services.llm import LLMProvider, LLMService
+            llm = LLMService(provider=LLMProvider.OPENROUTER)
+            ok, detail = llm.test_connection(LLMProvider.OPENROUTER)
+            return jsonify({'code': 1 if ok else 0, 'msg': detail})
         
         elif service == 'finnhub':
             import requests
@@ -2475,8 +2477,10 @@ def test_connection():
         return jsonify({'code': 0, 'msg': 'Unknown service'})
     
     except Exception as e:
-        logger.error(f"Connection test failed: {e}")
-        return jsonify({'code': 0, 'msg': f'Test failed: {str(e)}'})
+        # The Finnhub endpoint carries the key as a query parameter, and requests
+        # embeds the URL in exception text, so scrub before logging/returning it.
+        logger.error(f"Connection test failed: {redact_secrets(e)}")
+        return jsonify({'code': 0, 'msg': f'Test failed: {redact_secrets(e)}'})
 
 # openapi-compat: legacy import name
 settings_bp = settings_blp

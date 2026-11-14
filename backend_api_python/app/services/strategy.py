@@ -159,14 +159,20 @@ class StrategyService:
                 cur.close()
                 return str(current.get("status") or "") == status
             cur.execute(
-                f"SELECT id, user_id, status FROM qd_strategies_trading WHERE {where} FOR UPDATE",
+                f"""
+                SELECT id, user_id, status, desired_runtime_epoch
+                FROM qd_strategies_trading
+                WHERE {where}
+                FOR UPDATE
+                """,
                 tuple(lookup_values),
             )
             strategy = cur.fetchone() or {}
             if not strategy:
                 cur.close()
                 return False
-            if str(strategy.get("status") or "") != "running":
+            current_status = str(strategy.get("status") or "")
+            if current_status != "running":
                 owner_id = int(strategy["user_id"])
                 cur.execute(
                     "SELECT vip_expires_at, vip_plan, vip_is_lifetime FROM qd_users WHERE id=? FOR UPDATE",
@@ -199,9 +205,58 @@ class StrategyService:
                     db.rollback()
                     cur.close()
                     raise StrategyLimitExceeded(limit, running)
+            if current_status == "running":
+                cur.execute(
+                    "UPDATE qd_strategies_trading SET status=?, updated_at=NOW() WHERE id=?",
+                    (status, int(strategy_id)),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET status=?,
+                        desired_runtime_epoch=GREATEST(COALESCE(desired_runtime_epoch, 0), 0) + 1,
+                        runtime_requested_at=NOW(),
+                        updated_at=NOW()
+                    WHERE id=?
+                    """,
+                    (status, int(strategy_id)),
+                )
+            changed = int(cur.rowcount or 0)
+            db.commit()
+            cur.close()
+        return changed > 0
+
+    def request_strategy_runtime_restart(
+        self,
+        strategy_id: int,
+        user_id: int | None = None,
+    ) -> bool:
+        """Advance the desired runtime generation without changing business state."""
+        with get_db_connection() as db:
+            cur = db.cursor()
+            where = "id = ?"
+            values: list[Any] = [int(strategy_id)]
+            if user_id is not None:
+                where += " AND user_id = ?"
+                values.append(int(user_id))
             cur.execute(
-                "UPDATE qd_strategies_trading SET status=?, updated_at=NOW() WHERE id=?",
-                (status, int(strategy_id)),
+                f"SELECT status FROM qd_strategies_trading WHERE {where} FOR UPDATE",
+                tuple(values),
+            )
+            strategy = cur.fetchone() or {}
+            if str(strategy.get("status") or "") != "running":
+                cur.close()
+                return False
+            cur.execute(
+                f"""
+                UPDATE qd_strategies_trading
+                SET desired_runtime_epoch=GREATEST(COALESCE(desired_runtime_epoch, 0), 0) + 1,
+                    runtime_requested_at=NOW(),
+                    updated_at=NOW()
+                WHERE {where}
+                """,
+                tuple(values),
             )
             changed = int(cur.rowcount or 0)
             db.commit()
@@ -235,16 +290,26 @@ class StrategyService:
         from app.services.strategy_v2 import get_strategy_v2_deployment_service
 
         changes = self._deployment_payload(payload)
+        existing_config = existing.get("trading_config") or {}
+        existing_risk = existing_config.get("deployment_risk") or {}
         merged = {
-            "sourceId": (existing.get("trading_config") or {}).get("script_source_id"),
+            "sourceId": existing_config.get("script_source_id"),
             "name": existing.get("strategy_name"),
             "initialCapital": existing.get("initial_capital"),
             "executionMode": existing.get("execution_mode"),
             "leverage": existing.get("leverage"),
             "leverageEnabled": float(existing.get("leverage") or 1) > 1,
-            "params": (existing.get("trading_config") or {}).get("params") or {},
-            "directionMode": (existing.get("trading_config") or {}).get("direction_mode") or "",
-            "positionSide": (existing.get("trading_config") or {}).get("position_side") or "",
+            "params": existing_config.get("params") or {},
+            "directionMode": existing_config.get("direction_mode") or "",
+            "positionSide": existing_config.get("position_side") or "",
+            "equityTakeProfitPct": existing_risk.get(
+                "equity_take_profit_pct",
+                existing_config.get("equity_take_profit_pct", 0),
+            ),
+            "equityStopLossPct": existing_risk.get(
+                "equity_stop_loss_pct",
+                existing_config.get("equity_stop_loss_pct", 0),
+            ),
         }
         merged.update({key: value for key, value in changes.items() if value is not None})
         get_strategy_v2_deployment_service().save(
@@ -446,6 +511,8 @@ class StrategyService:
             resolved = resolve_exchange_config(exchange_config, user_id=user_id)
             client = create_client(resolved, market_type=str(resolved.get("market_type") or "swap"))
             data = client.get_account_summary() if hasattr(client, "get_account_summary") else {}
+            if not isinstance(data, dict) or data.get("success") is False:
+                return {"success": False, "message": "strategyV2.connectionFailed", "data": data}
             return {"success": True, "message": "strategyV2.connectionOk", "data": data}
         except Exception as exc:
             return {"success": False, "message": str(exc), "data": None}
@@ -476,6 +543,7 @@ class StrategyService:
             "sourceId", "name", "initialCapital", "executionMode", "credentialId",
             "leverageEnabled", "leverage", "params", "notificationChannels",
             "notificationTargets", "directionMode", "positionSide", "aiDecisionFilter",
+            "equityTakeProfitPct", "equityStopLossPct",
         }
         unsupported = set(payload) - allowed - {"user_id"}
         if unsupported:

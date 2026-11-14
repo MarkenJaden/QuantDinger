@@ -43,7 +43,17 @@ FRIENDLY_ERROR_PATTERNS = [
         "quickTrade.errorHints.invalidPrice",
     ),
     (
-        re.compile(r"rate.?limit|too many request|429|REQUEST_FREQUENCY", re.IGNORECASE),
+        re.compile(
+            r"(?<!\d)-4411(?!\d)|Please\s+sign\s+TradFi[- ]Perps?\s+agreement",
+            re.IGNORECASE,
+        ),
+        "quickTrade.errorHints.binanceTradFiAgreement",
+    ),
+    (
+        re.compile(
+            r"too many requests?|HTTP\s*429|(?<!\d)(?:-1003|-1015|429)(?!\d)|REQUEST_FREQUENCY|rate[ _-]limit(?:ed|\s+(?:exceeded|reached))?\b",
+            re.IGNORECASE,
+        ),
         "quickTrade.errorHints.rateLimit",
     ),
     (
@@ -101,6 +111,12 @@ def exchange_error_user_message(*, exchange_id: str, err: str) -> Dict[str, str]
         return {
             "message": "OKX_SWAP_ACCOUNT_MODE_REQUIRED",
             "hint_key": "quickTrade.errorHints.okxAccountMode",
+        }
+
+    if "BITGET_UTA_HYBRID_BALANCE_UNAVAILABLE" in text:
+        return {
+            "message": "BITGET_UTA_HYBRID_BALANCE_UNAVAILABLE",
+            "hint_key": "quickTrade.errorHints.bitgetUnifiedAccount",
         }
 
     if "40018" in text or "invalid ip" in low:

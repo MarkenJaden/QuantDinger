@@ -96,6 +96,16 @@ def test_strategy_generation_prompt_preserves_native_multi_timeframes():
     assert "Keep single-timeframe source single-timeframe" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
 
 
+def test_strategy_generation_prompt_matches_market_and_execution_boundaries():
+    assert "hard market-data route" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "Never silently replace it with another exchange" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "already filtered to completed bars" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "queued `signal` intent can never become a live order" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "Risk-reducing exits may still complete" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "hard data route and execution identity" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
+    assert "Keep deployment `execution_mode` out of strategy source" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
+
+
 def test_indicator_prompt_remains_chart_only():
     assert "chart indicator is visual analysis code only" in INDICATOR_SYSTEM_CONTRACT
     assert "must not open, close, size, backtest, or live trade" in INDICATOR_SYSTEM_CONTRACT
@@ -108,7 +118,50 @@ def test_indicator_generation_prompt_uses_notification_safe_signal_contract():
     assert "Signal names are dynamic" in INDICATOR_GENERATION_CONTRACT
     assert "does not restrict signal names" in INDICATOR_GENERATION_CONTRACT
     assert "one-bar edge events" in INDICATOR_GENERATION_CONTRACT
+    assert "never emit `type='up'` or `type='down'`" in INDICATOR_GENERATION_CONTRACT
     assert "never infer activation from `text` or `textData`" in INDICATOR_REPAIR_REQUIREMENTS
+
+
+def test_indicator_generation_prompt_preserves_pine_projection_semantics():
+    assert "Pine pivot backpainting is a visual exception" in INDICATOR_GENERATION_CONTRACT
+    assert "`extendRight=True`" in INDICATOR_GENERATION_CONTRACT
+    assert "Wilder/RMA seeding" in INDICATOR_GENERATION_CONTRACT
+    assert "canonical renderer style fields" in INDICATOR_GENERATION_CONTRACT
+
+
+def test_indicator_generation_prompt_defines_zone_layer_contract():
+    assert "'top': number, 'bottom': number" in INDICATOR_GENERATION_CONTRACT
+    assert "never cloud-only `upper`/`lower`" in INDICATOR_GENERATION_CONTRACT
+    assert "connecting successive boxes with continuous line plots" in INDICATOR_GENERATION_CONTRACT
+    assert "final mutated fill, border, and dashed state" in INDICATOR_REPAIR_REQUIREMENTS
+
+
+def test_indicator_generation_prompt_preserves_stateful_pine_object_lifecycle():
+    assert "chronological single-pass object state machine" in INDICATOR_GENERATION_CONTRACT
+    assert "freeze the previous object's endpoint and style" in INDICATOR_GENERATION_CONTRACT
+    assert "apply later `set_*` mutations only to the object currently referenced" in INDICATOR_GENERATION_CONTRACT
+    assert "merge support, resistance, bullish, bearish" in INDICATOR_GENERATION_CONTRACT
+    assert "never concatenate objects by semantic type" in INDICATOR_GENERATION_CONTRACT
+    assert "solid historical trend plot" in INDICATOR_GENERATION_CONTRACT
+    assert "two source points preserve the exact slope" in INDICATOR_GENERATION_CONTRACT
+    assert "without adding a distant autoscale point" in INDICATOR_GENERATION_CONTRACT
+    assert "Do not approximate the projection with a horizontal ray" in INDICATOR_GENERATION_CONTRACT
+
+
+def test_indicator_generation_prompt_uses_native_cloud_contract():
+    assert "`line`, `bar`, `circle`, and `cloud`" in INDICATOR_GENERATION_CONTRACT
+    assert "'upper': number" in INDICATOR_GENERATION_CONTRACT
+    assert "'lower': number" in INDICATOR_GENERATION_CONTRACT
+    assert "Translate Pine `fill()`" in INDICATOR_GENERATION_CONTRACT
+    assert "never emit one `zone` or box layer per bar" in INDICATOR_GENERATION_CONTRACT
+    assert "Preserve valid `cloud` plots" in INDICATOR_REPAIR_REQUIREMENTS
+    assert "replace them with one `cloud` plot" in INDICATOR_REPAIR_REQUIREMENTS
+
+
+def test_indicator_generation_prompt_routes_sparse_price_events_to_signals():
+    assert "Pine `plotshape`, labels, diamonds" in INDICATOR_GENERATION_CONTRACT
+    assert "to `signals`, not to `circle` plots" in INDICATOR_GENERATION_CONTRACT
+    assert "do not change renderer or plot contracts" in INDICATOR_REPAIR_REQUIREMENTS
 
 
 def test_indicator_generation_and_repair_prompts_are_english_only():
@@ -136,6 +189,29 @@ def test_indicator_ide_hidden_prompt_is_english_and_uses_central_contract():
     assert "`locals()` is allowed" not in ai_generate_source
     assert "shift(1, fill_value=False).astype(bool)" in ai_generate_source
     assert "~s.shift(1).fillna(False)" not in ai_generate_source
+    assert "Recognize native `line`, `bar`, `circle`, and `cloud` plots" in ai_generate_source
+
+
+def test_indicator_quality_endpoint_can_skip_runtime_smoke_for_publishing():
+    route_path = Path(__file__).parents[1] / "app" / "routes" / "indicator.py"
+    route_source = route_path.read_text(encoding="utf-8")
+    start = route_source.index("def code_quality_hints():")
+    quality_source = route_source[start:]
+
+    assert 'data.get("runtimeCheck", True) is not False' in quality_source
+    assert "if runtime_check and not has_static_error" in quality_source
+
+
+def test_indicator_publish_enqueues_translation_off_the_request_path():
+    root = Path(__file__).parents[1]
+    route_source = (root / "app" / "routes" / "indicator.py").read_text(encoding="utf-8")
+    celery_source = (root / "app" / "celery_app.py").read_text(encoding="utf-8")
+    task_source = (root / "app" / "tasks" / "indicator_translation.py").read_text(encoding="utf-8")
+
+    assert "translate_indicator_metadata.delay(" in route_source
+    assert '"app.tasks.indicator_translation"' in celery_source
+    assert 'name="quantdinger.tasks.indicator_translation"' in task_source
+    assert "WHERE id = ? AND user_id = ? AND name = ? AND description = ?" in task_source
 
 
 def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):

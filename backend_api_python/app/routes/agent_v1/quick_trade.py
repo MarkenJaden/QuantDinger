@@ -3,7 +3,8 @@
 Live execution from agents requires *all* of the following:
   1. Token has scope `T`.
   2. Token has `paper_only=false` (operator must flip explicitly).
-  3. Server-side env `AGENT_LIVE_TRADING_ENABLED=true` (deployment kill switch).
+  3. Global live execution is enabled with `LIVE_TRADING_ENABLED=true`.
+  4. Agent live execution is enabled with `AGENT_LIVE_TRADING_ENABLED=true`.
 
 Until live is unlocked, this endpoint records orders to `qd_agent_paper_orders`
 using the latest market price as the simulated fill — so AI workflows can
@@ -17,6 +18,7 @@ import uuid
 from typing import Any
 
 from app.services.kline import KlineService
+from app.services.settings.capabilities import is_live_trading_enabled
 from app.utils.agent_auth import (
     SCOPE_T, agent_required, current_token, current_user_id,
     instrument_allowed, market_allowed, paper_only, with_idempotency,
@@ -38,7 +40,8 @@ _ORDER_FIELDS = {
 
 
 def _live_trading_kill_switch() -> bool:
-    return os.getenv("AGENT_LIVE_TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+    agent_enabled = os.getenv("AGENT_LIVE_TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+    return is_live_trading_enabled() and agent_enabled
 
 
 def _last_price(market: str, symbol: str) -> float | None:
@@ -302,8 +305,16 @@ def _place_live_order(*, body: dict, user_id: int) -> dict:
     commission_ccy = ""
     commission_quote = None
     exchange_status = ""
+    enrich = {"fee_status": "pending", "fees_by_ccy": {}}
     if exchange_order_id:
-        enrich = enrich_fill(client, order_id=exchange_order_id, symbol=symbol, market_type=market_type)
+        enrich = enrich_fill(
+            client,
+            order_id=exchange_order_id,
+            symbol=symbol,
+            market_type=market_type,
+            max_wait_sec=0.25,
+            initial_order=raw,
+        )
         if enrich.get("filled", 0.0) > 0:
             filled = float(enrich["filled"])
         if enrich.get("avg_price", 0.0) > 0:
@@ -311,14 +322,21 @@ def _place_live_order(*, body: dict, user_id: int) -> dict:
         commission = float(enrich.get("fee") or 0.0)
         commission_ccy = str(enrich.get("fee_ccy") or "")
         exchange_status = str(enrich.get("status") or "")
-        from app.services.live_trading.fee_quote import fee_to_quote
-        commission_quote = fee_to_quote(
-            client,
-            symbol=symbol,
-            fee=commission,
-            fee_ccy=commission_ccy,
-            fill_price=avg_fill,
-        )
+        from app.services.quick_trade.fee_reconciliation import fee_update_from_fill
+        fee_update = fee_update_from_fill(client, symbol, enrich, fallback_price=avg_fill)
+        if fee_update:
+            commission = fee_update["commission"]
+            commission_ccy = fee_update["commission_ccy"]
+            commission_quote = fee_update["commission_quote"]
+        else:
+            from app.services.live_trading.fee_quote import fee_to_quote
+            commission_quote = fee_to_quote(
+                client,
+                symbol=symbol,
+                fee=commission,
+                fee_ccy=commission_ccy,
+                fill_price=avg_fill,
+            )
 
     tp_price = float(body.get("tp_price") or body.get("tpPrice") or 0)
     sl_price = float(body.get("sl_price") or body.get("slPrice") or 0)
@@ -356,6 +374,8 @@ def _place_live_order(*, body: dict, user_id: int) -> dict:
         "native_protection_error": protection_error,
         "protected_filled_qty": filled if protection_result else 0.0,
         "margin_mode": margin_mode,
+        "fees_by_ccy": dict(enrich.get("fees_by_ccy") or {}),
+        "fee_status": str(enrich.get("fee_status") or "pending"),
     }
 
     trade_id = _record_quick_trade(
@@ -453,13 +473,12 @@ def place_order():
                 "previous": existing.get("result"),
             }, message="idempotent replay")
 
-    # Live trading is hard-gated. Even with paper_only=false on the token, the
-    # operator must enable AGENT_LIVE_TRADING_ENABLED to actually route to
-    # exchange clients — keeping a final environment-level kill switch.
+    # Live trading is hard-gated. Even with paper_only=false on the token, both
+    # deployment switches must allow live execution before exchange clients are used.
     if not paper_only() and not _live_trading_kill_switch():
         return error(
             501,
-            "Live agent trading is disabled by AGENT_LIVE_TRADING_ENABLED",
+            "Live agent trading requires LIVE_TRADING_ENABLED and AGENT_LIVE_TRADING_ENABLED",
             http=501,
         )
 

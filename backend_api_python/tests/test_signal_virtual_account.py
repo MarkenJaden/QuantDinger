@@ -10,6 +10,7 @@ from app.services.virtual_trading import (
     execute_virtual_signal_order,
     mark_virtual_positions,
     match_virtual_limit_orders,
+    reconcile_virtual_account_capital,
 )
 from app.services.virtual_execution_costs import (
     VIRTUAL_COMMISSION_RATE,
@@ -72,6 +73,32 @@ def test_virtual_fill_without_position_is_not_fabricated():
     assert result.status == "no_position"
     assert result.fill_quantity == 0
     assert result.gross_realized_pnl == 0
+
+
+def test_virtual_account_capital_rebases_without_erasing_realized_pnl():
+    calls = []
+
+    class Cursor:
+        def execute(self, query, params=()):
+            calls.append((" ".join(str(query).split()), params))
+
+    account = reconcile_virtual_account_capital(
+        Cursor(),
+        strategy_id=1105,
+        account={
+            "initial_cash": 1000,
+            "cash_balance": 984.7821,
+            "realized_pnl": -15.2179,
+            "total_commission": 3.5,
+        },
+        strategy_initial_cash=20000,
+    )
+
+    assert account["initial_cash"] == pytest.approx(20000)
+    assert account["cash_balance"] == pytest.approx(19984.7821)
+    assert account["realized_pnl"] == pytest.approx(-15.2179)
+    assert calls[0][1] == pytest.approx((19000, 1105))
+    assert calls[1][1] == pytest.approx((20000, 19984.7821, 1105))
 
 
 def test_virtual_limit_order_waits_for_touch_and_never_fills_worse_than_limit():
@@ -143,6 +170,188 @@ def test_virtual_limit_matcher_uses_fresh_price_and_preserves_limit(monkeypatch)
     assert executions[0][1]["ref_price"] == pytest.approx(94)
     assert executions[0][1]["_virtual_fill_price"] == pytest.approx(94.047)
     assert executions[0][1]["_virtual_fill_price"] <= row["limit_price"]
+
+
+def test_equity_virtual_order_does_not_match_while_market_is_closed(monkeypatch):
+    from app.services import virtual_trading
+
+    row = {
+        "id": 8,
+        "user_id": 7,
+        "strategy_id": 3,
+        "strategy_run_id": 4,
+        "pending_order_id": 14,
+        "order_intent_id": 22,
+        "symbol": "USStock:AAPL",
+        "action": "open_long",
+        "order_type": "limit",
+        "requested_qty": 2,
+        "limit_price": 195,
+        "slippage_rate": 0.0005,
+        "strategy_market_category": "USStock",
+        "payload_json": "{}",
+    }
+
+    class Cursor:
+        def execute(self, *args, **kwargs):
+            return None
+
+        def fetchall(self):
+            return [row]
+
+        def close(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(virtual_trading, "get_db_connection", connection)
+    monkeypatch.setattr(virtual_trading, "is_equity_market_open", lambda market: False)
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda *_: pytest.fail("closed equity market must not fill"),
+    )
+
+    assert match_virtual_limit_orders(3, {"USStock:AAPL": 194}, strategy_run_id=4) == []
+
+
+def test_deferred_equity_market_order_matches_after_market_reopens(monkeypatch):
+    from app.services import virtual_trading
+
+    row = {
+        "id": 9,
+        "user_id": 7,
+        "strategy_id": 3,
+        "strategy_run_id": 4,
+        "pending_order_id": 15,
+        "order_intent_id": 23,
+        "symbol": "HKStock:00700",
+        "action": "open_long",
+        "order_type": "market",
+        "requested_qty": 100,
+        "limit_price": 0,
+        "slippage_rate": 0.0005,
+        "strategy_market_category": "HKStock",
+        "payload_json": "{}",
+    }
+
+    class Cursor:
+        def execute(self, *args, **kwargs):
+            return None
+
+        def fetchall(self):
+            return [row]
+
+        def close(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    executions = []
+    monkeypatch.setattr(virtual_trading, "get_db_connection", connection)
+    monkeypatch.setattr(virtual_trading, "is_equity_market_open", lambda market: True)
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda order, payload: executions.append((order, payload)) or {"status": "filled"},
+    )
+
+    matched = match_virtual_limit_orders(3, {"HKStock:00700": 400}, strategy_run_id=4)
+
+    assert matched == [{"status": "filled"}]
+    assert executions[0][1]["order_type"] == "market"
+    assert executions[0][1]["_virtual_fill_price"] == pytest.approx(400.2)
+
+
+def test_closed_equity_market_order_is_persisted_open_instead_of_filled(monkeypatch):
+    from app.services import virtual_trading
+
+    class Cursor:
+        def __init__(self):
+            self.query = ""
+
+        def execute(self, query, params=()):
+            self.query = " ".join(str(query).split())
+
+        def fetchone(self):
+            if "FROM qd_strategies_trading" in self.query:
+                return {
+                    "id": 3,
+                    "user_id": 7,
+                    "execution_mode": "signal",
+                    "initial_capital": 100000,
+                    "exchange_config": {},
+                    "trading_config": {},
+                    "market_type": "spot",
+                    "leverage": 1,
+                    "market_category": "USStock",
+                }
+            if "FROM qd_strategy_virtual_orders" in self.query:
+                return {}
+            if "FROM qd_strategy_virtual_accounts" in self.query:
+                return {"initial_cash": 100000}
+            if "INSERT INTO qd_strategy_virtual_orders" in self.query:
+                return {"id": 91}
+            return {}
+
+        def close(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(virtual_trading, "get_db_connection", connection)
+    monkeypatch.setattr(virtual_trading, "is_equity_market_open", lambda market: False)
+
+    result = execute_virtual_signal_order(
+        {
+            "id": 14,
+            "user_id": 7,
+            "strategy_id": 3,
+            "strategy_run_id": 4,
+            "execution_mode": "signal",
+            "symbol": "USStock:AAPL",
+            "signal_type": "open_long",
+            "amount": 2,
+            "price": 195,
+            "order_type": "market",
+        },
+        {
+            "strategy_id": 3,
+            "strategy_run_id": 4,
+            "execution_mode": "signal",
+            "symbol": "USStock:AAPL",
+            "signal_type": "open_long",
+            "amount": 2,
+            "price": 195,
+            "order_type": "market",
+        },
+    )
+
+    assert result["status"] == "open"
+    assert result["fill_quantity"] == 0
+    assert result["fill_price"] == 0
+    assert result["deferred_reason"] == "market_closed"
 
 
 def test_virtual_position_mark_uses_strategy_scoped_price_and_updates_short_pnl(monkeypatch):
@@ -333,6 +542,7 @@ def test_live_dispatch_never_calls_virtual_account(monkeypatch):
 
     live_calls = []
     monkeypatch.setattr(cancellations, "intercept_cancelled_dispatch", lambda row: False)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {"execution_mode": "live"})
     monkeypatch.setattr(
         virtual_trading,
         "execute_virtual_signal_order",
@@ -351,6 +561,104 @@ def test_live_dispatch_never_calls_virtual_account(monkeypatch):
         "amount": 2,
         "price": 100,
         "payload_json": "{}",
+    })
+
+    assert len(live_calls) == 1
+
+
+def test_stale_signal_entry_is_rejected_without_reaching_either_executor(monkeypatch):
+    from app.services import virtual_trading
+    from app.services.strategy_runtime import cancellations
+
+    live_calls = []
+    virtual_calls = []
+    failures = []
+    monkeypatch.setattr(cancellations, "intercept_cancelled_dispatch", lambda row: False)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {"execution_mode": "live"})
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda *args, **kwargs: virtual_calls.append((args, kwargs)),
+    )
+
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._load_strategy_name = lambda strategy_id: "Test"
+    worker._mark_failed = lambda **kwargs: failures.append(kwargs)
+    worker._execute_live_order = lambda **kwargs: live_calls.append(kwargs)
+
+    worker._dispatch_one({
+        "id": 15,
+        "strategy_id": 3,
+        "execution_mode": "signal",
+        "symbol": "BTC/USDT",
+        "signal_type": "open_long",
+        "amount": 2,
+        "price": 100,
+        "payload_json": '{"strategy_id":3,"execution_mode":"signal"}',
+    })
+
+    assert live_calls == []
+    assert virtual_calls == []
+    assert failures and "execution_mode_mismatch" in failures[0]["error"]
+
+
+def test_stale_live_entry_is_rejected_without_reaching_either_executor(monkeypatch):
+    from app.services import virtual_trading
+    from app.services.strategy_runtime import cancellations
+
+    live_calls = []
+    virtual_calls = []
+    failures = []
+    monkeypatch.setattr(cancellations, "intercept_cancelled_dispatch", lambda row: False)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {"execution_mode": "signal"})
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda *args, **kwargs: virtual_calls.append((args, kwargs)),
+    )
+
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._load_strategy_name = lambda strategy_id: "Test"
+    worker._mark_failed = lambda **kwargs: failures.append(kwargs)
+    worker._execute_live_order = lambda **kwargs: live_calls.append(kwargs)
+
+    worker._dispatch_one({
+        "id": 16,
+        "strategy_id": 3,
+        "execution_mode": "live",
+        "symbol": "BTC/USDT",
+        "signal_type": "open_long",
+        "amount": 2,
+        "price": 100,
+        "payload_json": '{"strategy_id":3,"execution_mode":"live"}',
+    })
+
+    assert live_calls == []
+    assert virtual_calls == []
+    assert failures and "execution_mode_mismatch" in failures[0]["error"]
+
+
+def test_mode_change_does_not_block_a_risk_reducing_exit(monkeypatch):
+    from app.services.strategy_runtime import cancellations
+
+    live_calls = []
+    monkeypatch.setattr(cancellations, "intercept_cancelled_dispatch", lambda row: False)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {"execution_mode": "signal"})
+
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._load_strategy_name = lambda strategy_id: "Test"
+    worker._mark_failed = lambda **kwargs: pytest.fail(str(kwargs))
+    worker._execute_live_order = lambda **kwargs: live_calls.append(kwargs)
+
+    worker._dispatch_one({
+        "id": 17,
+        "strategy_id": 3,
+        "execution_mode": "live",
+        "symbol": "BTC/USDT",
+        "signal_type": "close_long_stop",
+        "amount": 2,
+        "price": 100,
+        "payload_json": '{"strategy_id":3,"execution_mode":"live"}',
     })
 
     assert len(live_calls) == 1

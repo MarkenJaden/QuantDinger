@@ -211,8 +211,17 @@ def test_bitget_demo_and_live_use_matching_private_websocket_hosts():
     live, _states = _adapter(BitgetExecutionAdapter)
     live.config["environment"] = "live"
 
-    assert demo.url() == "wss://wspap.bitget.com/v2/ws/private"
-    assert live.url() == "wss://ws.bitget.com/v2/ws/private"
+    assert demo.url() == "wss://wspap.bitget.com/v3/ws/private"
+    assert live.url() == "wss://ws.bitget.com/v3/ws/private"
+
+
+def test_okx_demo_and_live_use_port_443_private_websocket_hosts():
+    demo, _states = _adapter(OkxExecutionAdapter)
+    live, _states = _adapter(OkxExecutionAdapter)
+    live.config["environment"] = "live"
+
+    assert demo.url() == "wss://wspap.okx.com/ws/v5/private"
+    assert live.url() == "wss://ws.okx.com/ws/v5/private"
 
 
 def test_bybit_subscribes_only_after_successful_authentication():
@@ -231,19 +240,15 @@ def test_bybit_heartbeat_response_does_not_trigger_an_extra_pong():
     assert ws.messages == []
 
 
-@pytest.mark.parametrize(
-    ("market_type", "inst_type"),
-    (("spot", "SPOT"), ("swap", "USDT-FUTURES")),
-)
-def test_bitget_uses_market_specific_fill_subscription(market_type, inst_type):
+@pytest.mark.parametrize("market_type", ("spot", "swap"))
+def test_bitget_uses_uta_fill_subscription(market_type):
     adapter, _states = _adapter(BitgetExecutionAdapter, market_type=market_type)
     assert adapter.on_open_messages()[0]["op"] == "login"
     ws = FakeSocket()
     adapter.handle_control(ws, {"event": "login", "code": "0"})
     assert ws.messages[0]["args"][0] == {
-        "instType": inst_type,
-        "channel": "fill",
-        "instId": "default",
+        "instType": "UTA",
+        "topic": "fill",
     }
 
 
@@ -298,6 +303,28 @@ def test_htx_spot_subscribes_known_symbols_after_authentication():
         "trade.clearing#btcusdt",
         "trade.clearing#ethusdt",
     }
+
+
+def test_htx_authentication_failures_pause_after_limit(monkeypatch):
+    monkeypatch.setenv("EXECUTION_STREAM_AUTH_MAX_FAILURES", "3")
+    adapter, states = _adapter(HtxExecutionAdapter, market_type="spot")
+
+    for _ in range(3):
+        ws = FakeSocket()
+        adapter.handle_control(
+            ws,
+            {
+                "action": "req",
+                "ch": "auth",
+                "code": 403,
+                "message": "Incorrect IP address",
+            },
+        )
+        assert ws.closed
+
+    assert states == ["error", "error", "paused"]
+    assert adapter._auth_paused is True
+    assert adapter._stop.is_set()
 
 
 def test_alpaca_listens_for_trade_updates_after_authorization():

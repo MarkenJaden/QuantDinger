@@ -30,7 +30,11 @@ from .instruments import (
     normalize_pool_reference,
     parse_instrument,
 )
-from .frequencies import FREQUENCY_SECONDS, unique_frequencies
+from .frequencies import (
+    FREQUENCY_SECONDS,
+    SUPPORTED_SUBSCRIPTION_FREQUENCIES,
+    unique_frequencies,
+)
 from .models import (
     InstrumentSpec,
     ScheduleSpec,
@@ -38,6 +42,9 @@ from .models import (
     SubscriptionSpec,
     UniverseSpec,
 )
+
+
+PLATFORM_MAX_LEVERAGE = 100.0
 
 
 V2_HANDLER_NAMES = (
@@ -174,9 +181,9 @@ class DiscoveryContext:
         self.warmup_bars = max(0, int(bars or 0))
 
     def allow_leverage(self, max_leverage: object = 1) -> None:
-        value = max(1.0, float(max_leverage or 1.0))
+        value = min(PLATFORM_MAX_LEVERAGE, max(1.0, float(max_leverage or 1.0)))
         self.leverage_allowed = value > 1.0
-        self.max_leverage = value
+        self.max_leverage = value if self.leverage_allowed else 1.0
 
     def set_metadata(self, *args: Any, **values: Any) -> None:
         if len(args) == 1 and isinstance(args[0], Mapping):
@@ -303,7 +310,7 @@ def compile_strategy_v2(code: str) -> CompiledStrategyV2:
     unsupported = [
         item
         for item in frequencies
-        if item not in FREQUENCY_SECONDS
+        if item not in SUPPORTED_SUBSCRIPTION_FREQUENCIES
     ]
     if unsupported:
         raise StrategyV2ContractError(
@@ -550,6 +557,26 @@ _ORDER_API_ARGUMENTS = {
     "order_target": ("symbol", "amount"),
     "order_target_value": ("symbol", "value"),
     "order_target_percent": ("symbol", "percent"),
+}
+
+_ORDER_API_OPTION_NAMES = {
+    "client_order_id",
+    "execution_algo",
+    "limit_price",
+    "maker_offset_bps",
+    "maker_wait_sec",
+    "order_type",
+    "position_side",
+    "price",
+    "protection",
+    "reason",
+    "stop_loss_pct",
+    "take_profit_pct",
+    "time_limit_seconds",
+    "trailing_activation_pct",
+    "trailing_rebase_on_scale_in",
+    "trailing_stop_pct",
+    "type",
 }
 
 _UNSUPPORTED_STRATEGY_API_NAMES = {
@@ -924,6 +951,11 @@ def _validate_order_call(
 ) -> None:
     required = _ORDER_API_ARGUMENTS[call_name]
     keywords = _call_keywords(node)
+    unsupported = sorted(set(keywords) - set(required) - _ORDER_API_OPTION_NAMES)
+    if unsupported:
+        raise StrategyV2ContractError(
+            f"strategyV2.apiCallInvalid:{call_name}:unsupportedArgument:{unsupported[0]}"
+        )
     if len(node.args) > 2:
         raise StrategyV2ContractError(
             f"strategyV2.apiCallInvalid:{call_name}:expectedSymbolAndValue"
