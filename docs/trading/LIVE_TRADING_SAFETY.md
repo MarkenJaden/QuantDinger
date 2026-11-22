@@ -47,9 +47,43 @@ A grid with no confirmed working orders must not report successful startup, unle
 - WebSocket improves latency; REST reconciliation remains the recovery source after disconnects.
 - A strategy manages only its allocated position and must not absorb manual or other-strategy inventory.
 
+### Strategy equity and shared accounts
+
+Strategy API V2 sizes orders from the deployment's current equity: configured initial capital plus lifetime realized price P&L, minus recorded trading fees, plus signed funding and broker activities, plus unrealized P&L on strategy-owned positions. Stopping and starting a strategy or restarting a worker does not reset that ledger. The runtime uses the same lifetime basis as the equity display; marks may differ briefly as prices update. Non-positive equity provides no opening budget. If the ledger query fails, the evaluation cycle fails instead of falling back to initial capital; existing runtime-failure handling applies. This does not cancel submitted orders or liquidate holdings.
+
+For example, equity of 36.36 with 2x leverage gives a nominal capacity of 72.72 before the existing budget buffer, costs and venue constraints, not the original 500 times 2. Percentage targets use current equity. Explicit quantities must still pass the strategy budget guard; a valid reduce-only exit is not blocked by that opening budget.
+
+Strategy net P&L uses the strategy's own recorded fills and allocated opening/closing fees. Venue-reported order P&L remains a separate value with the venue's fee basis. When manual trades share the same venue position, the venue's average entry cost can differ from the strategy's cost. Do not replace strategy P&L, equity or position cost with that order report, and do not import manual inventory to make the figures match. Use a dedicated account/subaccount for physical separation; advanced ownership mode protects quantities but cannot separate the venue's cost basis or margin.
+
+Confirmed order P&L saved in `qd_exchange_order_pnl` is reused while its reported quantity matches the order's recorded fills. It does not expire after five minutes or require a new venue request on page refresh or worker restart. Missing reports or changed fill quantities still use bounded reconciliation; failures for other orders do not hide matching saved results. WebSocket execution evidence is also stored in `qd_execution_events` and can be used to reconstruct reports. These reports remain display-only and do not replace the strategy ledger.
+
+### Closing precision and floating P&L
+
+Full-fill quantity arithmetic uses decimal addition/subtraction and absorbs only binary rounding noise at the closing fill's scale. Position writes update unrealized P&L together with quantity and price; a delayed mark cannot overwrite a changed quantity or entry cost. Live equity metrics and the equity curve derive floating P&L from the current row's quantity, entry price and mark, so an old cached profit cannot inflate equity after a close. Normal mark updates also revalue positive precision-tail rows. This does not introduce a universal small-position cutoff, delete historical trades or bulk-delete residual inventory.
+
 ### Alpaca fractional-share residuals
 
 For live `USStock` strategies using Alpaca, a full-exit intent is not queued when the remaining strategy position is at most `0.01` shares. This prevents repeated tail-close attempts and their failure notifications. The threshold is in shares, not dollars, and is an application policy rather than a broker minimum. The position and its value remain in the ledger; skipping an intent does not record a fill or mark the position flat. Larger closes, partial reductions, entries, signal mode, other brokers, and Crypto precision are unchanged. Existing queued orders are not cancelled by this rule.
+
+### Repeated order failures
+
+For individual orders outside a portfolio rebalance batch, the live pending-order worker stops a strategy after five consecutive definitive funding, credential, instrument, or account-configuration rejections. Invalid entry sizing also counts. The count belongs to the current strategy run and is stored in PostgreSQL; worker restarts do not reset it. A newly accepted exchange order resets the count. Enqueuing an order, an idle evaluation cycle, or receiving another update for an already accepted order does not reset it.
+
+One-way-mode opposite-inventory guards, ownership drift, reduce-only conflicts, undersized exits, price-band limits, rate limits, temporary connectivity failures, and unknown submission outcomes do not count. Ignored outcomes do not clear earlier definitive failures. Existing immediate-stop handling for fatal authentication/adapter errors remains in place.
+
+At the threshold, the run is marked stopped and its unsubmitted queued orders are blocked. A durable stop command cleans up the runtime; a command for an older runtime epoch cannot stop a restarted deployment. Already submitted orders still require exchange reconciliation. Automatic stops do not liquidate positions. If an operator explicitly selects stop-and-close while the command is still pending, that request is honored through the normal close-position safeguards.
+
+The completed stop creates one in-app notice and sends the alert through each external channel enabled for the strategy: email, SMS, Telegram, Discord, or Webhook (including supported chat-platform webhooks). Targets use strategy overrides, then the user's notification settings; email can also fall back to the account address. Each channel needs its delivery configuration, such as SMTP for email or Twilio for SMS. The alert identifies the strategy and failure reason and asks for manual review before restarting. Stop notices are claimed once per run. Delivery is best-effort; one channel's failure does not prevent attempts on the others, restart the strategy, or trigger repeated alerts.
+
+### Portfolio rebalance batches
+
+Orders queued by one portfolio evaluation share a durable batch identifier. Dispatch is still asynchronous and does not wait for notification aggregation. Once queueing is sealed, the worker waits until every queued order has an acceptance or terminal result before assessing the batch. Batches are assessed in creation order, not reply order. A pending or unknown submission does not become a failure merely because time has passed.
+
+Any accepted or partially/fully filled order makes the batch a success for the failure counter, even if other symbols fail. A completed batch with no success and at least one counted definitive rejection increments the counter once. Five such consecutive batches stop the strategy; ten rejected orders in one batch count as one failed batch. Batches containing only ignored protective outcomes do not increment or clear the counter. Individual-order and batch failure units are not added together. Successful legs are not rolled back, failed legs remain visible, and this policy does not add automatic retries.
+
+Portfolio notifications are consolidated into one snapshot per user, strategy run and batch, in both live and signal mode. Each selected channel receives one summary instead of per-order notifications. The worker claims the summary when results are available, or on its first reconciliation pass at least 30 seconds after queueing finishes. The summary distinguishes accepted, filled, partially filled, failed, cancelled and pending orders; it does not claim a complete rebalance or real fills in signal mode. Short-message channels may truncate details at their existing message limits; counts appear first, and full order records remain available in the application. Later updates do not send another batch summary. Per-order logs remain intact. Automatic-stop alerts remain separate and do not wait for a batch summary.
+
+Batch state and notification claims persist across worker restarts. Channel delivery is independent and best-effort: a failed channel does not block the others, but a claimed summary is not automatically resent after a delivery error or a crash during sending. Delivery runs separately from order dispatch and exchange reconciliation. Apply the registered `20261121_strategy_order_batches.sql` migration before starting the updated workers. Existing queued orders without batch identifiers keep their previous per-order behavior; there is no retroactive regrouping.
 
 ### Rejected exits and notification limits
 
