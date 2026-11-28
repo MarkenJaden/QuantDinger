@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from app.data_sources.candle_calendar import candle_open
+from app.utils.binance_request_guard import binance_request_guard, traced_binance_request
 
 
 SUPPORTED_EXCHANGES = ("binance", "bitget", "bybit", "okx", "gate", "htx")
@@ -175,14 +176,24 @@ class NativeCryptoPublicClient:
         return session
 
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        from app.utils.exchange_request_guard import exchange_request_guard
+
         self._throttle()
-        response = self._http_session().get(
+        binance_request_guard.before_request(url, public=True)
+        scope = exchange_request_guard.before_request(url, params=params)
+        response = traced_binance_request(lambda: self._http_session().get(
             url,
             params=params or {},
             timeout=self.timeout,
             proxies=self._proxies,
             headers={"User-Agent": "QuantDinger/5 public-market"},
-        )
+        ), url)
+        try:
+            binance_request_guard.observe(url, response.status_code, getattr(response, "headers", {}), response.text)
+            exchange_request_guard.observe(scope, response.status_code, getattr(response, "headers", {}), response.text)
+        except Exception:
+            response.close()
+            raise
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:

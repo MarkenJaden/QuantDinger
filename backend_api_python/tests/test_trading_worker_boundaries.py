@@ -27,6 +27,7 @@ class FakeExecutor:
         self.policy_stops = []
         self.stop_result = stop_result
         self.handoffs = []
+        self.cancel_orders = []
 
     def start_strategy(self, strategy_id):
         self.running_strategies[int(strategy_id)] = object()
@@ -48,8 +49,9 @@ class FakeExecutor:
     def unregister_market_streams(self, strategy_id):
         self.unregistered_streams.append(int(strategy_id))
 
-    def stop_strategy(self, strategy_id, persist_status=False, preserve_run=False):
+    def stop_strategy(self, strategy_id, persist_status=False, preserve_run=False, cancel_orders=True):
         del persist_status
+        self.cancel_orders.append(cancel_orders)
         self.stopped.append(int(strategy_id))
         if preserve_run:
             self.handoffs.append(int(strategy_id))
@@ -158,6 +160,67 @@ def test_starting_command_is_deferred_until_real_readiness(monkeypatch):
     assert repository.completed[0][1]["status"] == "running"
 
 
+def test_cooldown_survives_start_timeout_and_exhausted_attempts_then_recovers(monkeypatch):
+    from dataclasses import replace
+    from app.utils.binance_request_guard import BinanceRateLimitError
+
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(worker, "_start", lambda sid: (_ for _ in ()).throw(BinanceRateLimitError(1084)))
+    command = replace(_command("start"), attempts=worker.max_attempts, elapsed_seconds=10000)
+    worker._execute(command)
+    assert not worker.repository.failed and not worker.repository.completed
+    result = worker.repository.deferred[-1][1]["result"]
+    assert result["retry_after_seconds"] == 1084
+    assert not worker.executor.stopped
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting"})
+    worker._execute(replace(command, result=result))
+    assert not worker.repository.failed
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "running"})
+    worker._execute(replace(command, result=result))
+    assert worker.repository.completed[-1][1]["status"] == "running"
+
+
+def test_start_wait_reads_durable_cooldown_but_respects_manual_stop(monkeypatch):
+    from app.services.strategy import StrategyService
+
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(StrategyService, "get_strategy", lambda *a: {"status": "running", "desired_runtime_epoch": 1})
+    monkeypatch.setattr(worker.repository, "runtime_request", lambda sid: {
+        "status": "running", "desired_runtime_epoch": 1, "retry_after_seconds": 1084, "startup_retry_at": 2000,
+    })
+    assert worker._start(55)["retry_after_seconds"] == 1084
+    assert not worker.executor.running_strategies
+    monkeypatch.setattr(StrategyService, "get_strategy", lambda *a: {"status": "stopped"})
+    assert worker._start(55)["status"] == "skipped"
+    assert not worker.executor.running_strategies
+
+
+def test_expired_cooldown_does_not_disable_real_startup_timeout(monkeypatch):
+    from dataclasses import replace
+
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting", "startup_retry_at": 1})
+    worker._execute(replace(_command("start"), elapsed_seconds=10000))
+    assert worker.repository.failed[0][1] == "strategyRuntime.startFailed"
+
+
+def test_restore_rate_limits_do_not_exhaust_attempts(monkeypatch):
+    from unittest.mock import Mock
+    from app.services.strategy import StrategyService
+    from app.services import strategy_lifecycle
+    from app.utils.binance_request_guard import BinanceRateLimitError
+
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(StrategyService, "get_running_strategies_with_type", lambda *a: [{"id": 55}])
+    monkeypatch.setattr(worker, "_start", Mock(side_effect=BinanceRateLimitError(1084)))
+    stopped = Mock()
+    monkeypatch.setattr(strategy_lifecycle, "maybe_auto_stop_on_exchange_error", stopped)
+    for _ in range(10):
+        worker.restore_desired_strategies()
+    stopped.assert_not_called()
+    assert worker._restore_failure_counts == {}
+
+
 def test_readiness_deadline_is_a_failure_not_infinite_polling(monkeypatch):
     from dataclasses import replace
 
@@ -167,6 +230,99 @@ def test_readiness_deadline_is_a_failure_not_infinite_polling(monkeypatch):
     worker._execute(replace(_command("start"), elapsed_seconds=10000))
     assert repository.deferred == []
     assert repository.failed[0][1] == "strategyRuntime.startFailed"
+
+
+def test_large_pool_startup_has_its_own_budget(monkeypatch):
+    from dataclasses import replace
+
+    monkeypatch.delenv("STRATEGY_RUNTIME_STARTUP_TIMEOUT_SECONDS", raising=False)
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting"})
+    worker._execute(replace(_command("start"), elapsed_seconds=300))
+    assert worker.repository.deferred and not worker.repository.failed
+
+
+def test_deferred_command_stops_heartbeat_before_database_transition(monkeypatch):
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting"})
+
+    def defer(command_id, **kwargs):
+        assert not worker._lease_heartbeat.command_valid(command_id)
+
+    monkeypatch.setattr(worker.repository, "defer_start", defer)
+    worker._execute(_command("start"))
+    assert not worker._stop.is_set()
+
+
+@pytest.mark.parametrize("stop_result", [True, False])
+def test_terminal_start_failure_fences_and_cleans_local_runtime(monkeypatch, stop_result):
+    from dataclasses import replace
+
+    executor = FakeExecutor(stop_result=stop_result)
+    executor.running_strategies[55] = object()
+    worker = TradingWorker(executor, FakeRepository())
+    worker._lease_heartbeat.watch_strategy(55)
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting"})
+    monkeypatch.setattr(executor, "wait_strategy_running", lambda *a, **kw: (False, "starting"))
+    marked = []
+    monkeypatch.setattr(TradingExecutor, "_mark_stopped", lambda sid, **kw: marked.append(sid))
+    worker._execute(replace(_command("start"), attempts=3, elapsed_seconds=10000))
+    assert marked == [55]
+    assert executor.stopped == [55] and executor.handoffs == []
+    assert executor.cancel_orders == [False]
+    assert not worker._lease_heartbeat.strategy_valid(55)
+    assert worker.repository.released == ([(55, worker.worker_id)] if stop_result else [])
+    assert not worker.repository.revoked
+
+
+def test_failed_start_cleanup_does_not_touch_newer_generation():
+    executor = FakeExecutor()
+    executor.running_strategies[55] = object()
+    worker = TradingWorker(executor, FakeRepository())
+    worker._lease_heartbeat.watch_strategy(55)
+    worker._cleanup_failed_start(55, expected_epoch=2)
+    assert not executor.stopped
+    assert worker._lease_heartbeat.strategy_valid(55)
+
+
+def test_runtime_ready_at_deadline_is_not_marked_failed(monkeypatch):
+    from dataclasses import replace
+
+    executor = FakeExecutor()
+    executor.running_strategies[55] = object()
+    worker = TradingWorker(executor, FakeRepository())
+    monkeypatch.setattr(worker, "_start", lambda sid: {"status": "starting"})
+    worker._execute(replace(_command("start"), attempts=3, elapsed_seconds=10000))
+    assert worker.repository.completed[0][1]["status"] == "running"
+    assert not worker.repository.failed and not executor.stopped
+
+
+def test_failed_start_releases_lease_after_runtime_already_exited():
+    worker = TradingWorker(FakeExecutor(), FakeRepository())
+    worker._lease_heartbeat.watch_strategy(55)
+    worker._cleanup_failed_start(55, expected_epoch=1)
+    assert not worker._lease_heartbeat.strategy_valid(55)
+    assert worker.repository.released == [(55, worker.worker_id)]
+
+
+def test_local_failure_cleanup_does_not_call_broker_shutdown(monkeypatch):
+    from types import SimpleNamespace
+
+    executor = object.__new__(TradingExecutor)
+    executor.lock = threading.Lock()
+    executor.stop_join_timeout = 0.1
+    executor._runtime_handoff_ids = set()
+    stop_event = threading.Event()
+    executor._runtime_stop_events = {55: stop_event}
+    joined = []
+    executor.running_strategies = {55: SimpleNamespace(
+        cancel=lambda: None, join=lambda **kw: joined.append(True), is_alive=lambda: False,
+    )}
+    monkeypatch.setattr("app.services.trading_executor.append_strategy_log", lambda *a: None)
+    monkeypatch.setattr("app.services.grid.runner.shutdown_grid_for_strategy", lambda *a: pytest.fail("broker shutdown"))
+    assert executor.stop_strategy(55, persist_status=False, cancel_orders=False)
+    assert stop_event.is_set() and joined
+    assert not executor.running_strategies and not executor._runtime_handoff_ids
 
 
 def test_delayed_stop_command_cannot_stop_a_later_start(monkeypatch):

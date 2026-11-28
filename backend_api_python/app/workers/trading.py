@@ -9,6 +9,7 @@ import time
 import uuid
 
 from app.services.strategy_command_repository import StrategyCommand, StrategyCommandRepository
+from app.services.strategy_runtime.cooldown import exchange_cooldown_seconds
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
 from app.workers.lease_heartbeat import LeaseHeartbeat
@@ -33,6 +34,9 @@ class TradingWorker:
         self.strategy_lease_seconds = max(10, int(os.getenv("STRATEGY_RUNTIME_LEASE_SEC", "30")))
         self.poll_seconds = max(0.1, float(os.getenv("STRATEGY_COMMAND_WORKER_POLL_SEC", "0.5")))
         self.max_attempts = max(1, int(os.getenv("STRATEGY_COMMAND_MAX_ATTEMPTS", "3")))
+        self.startup_timeout_seconds = max(
+            60.0, float(os.getenv("STRATEGY_RUNTIME_STARTUP_TIMEOUT_SECONDS", "900")),
+        )
         self.restore_max_attempts = max(
             1,
             int(os.getenv("STRATEGY_RESTORE_MAX_ATTEMPTS", "5")),
@@ -162,6 +166,9 @@ class TradingWorker:
                 self._restore_failure_counts.pop(strategy_id, None)
                 restored += int(result.get("status") == "running")
             except Exception as exc:
+                if exchange_cooldown_seconds(exc):
+                    self._restore_failure_counts.pop(strategy_id, None)
+                    continue
                 # Retry transient recovery failures, but stop deterministic or
                 # repeatedly failing strategies so recovery cannot loop forever.
                 failures = self._restore_failure_counts.get(strategy_id, 0) + 1
@@ -238,10 +245,22 @@ class TradingWorker:
                 result = self._reconcile(command.strategy_id)
             if self._lease_heartbeat.command_valid(command.id):
                 if result.get("status") == "starting":
-                    from app.services.strategy_v2.sandbox import live_sandbox_timeout_seconds
-
-                    if command.elapsed_seconds >= live_sandbox_timeout_seconds() + 60.0:
-                        raise RuntimeError("strategyRuntime.startFailed")
+                    recovery_deadline = float(result.get("startup_retry_at") or (command.result or {}).get("startup_retry_at") or 0)
+                    result["startup_retry_at"] = recovery_deadline
+                    cooldown_wait = float(result.get("retry_after_seconds") or 0) > 0
+                    deadline_expired = command.elapsed_seconds >= self.startup_timeout_seconds and (
+                        not recovery_deadline or time.time() >= recovery_deadline + self.startup_timeout_seconds
+                    )
+                    if not cooldown_wait and deadline_expired:
+                        ready = False
+                        if command.strategy_id in self._local_strategy_ids():
+                            ready, _hint = self.executor.wait_strategy_running(command.strategy_id, timeout=0.5)
+                        if not ready:
+                            raise RuntimeError("strategyRuntime.startFailed")
+                        result = {**result, "status": "running"}
+                if result.get("status") == "starting":
+                    # A deferred command is no longer renewable as processing.
+                    self._lease_heartbeat.forget_command()
                     self.repository.defer_start(
                         command.id, owner_id=self.worker_id, result=result,
                     )
@@ -253,6 +272,14 @@ class TradingWorker:
                 logger.warning("Command completion could not be recorded: %s", command.id, exc_info=True)
                 return
             self._lease_heartbeat.forget_command()
+            if command.command_type in {"start", "restart"} and exchange_cooldown_seconds(exc):
+                seconds = exchange_cooldown_seconds(exc)
+                self.repository.defer_start(command.id, owner_id=self.worker_id, result={
+                    "status": "starting", "reason": "marketData.rate_limited",
+                    "runtime_epoch": expected_epoch, "retry_after_seconds": seconds,
+                    "startup_retry_at": time.time() + seconds,
+                })
+                return
             append_strategy_log(command.strategy_id, "error", str(exc))
             logger.error(
                 "Strategy command failed: command=%s strategy=%s type=%s",
@@ -269,12 +296,33 @@ class TradingWorker:
                 if command.command_type in {"start", "restart"}:
                     from app.services.trading_executor import TradingExecutor
 
-                    TradingExecutor._mark_stopped(
-                        command.strategy_id,
-                        expected_epoch=expected_epoch or int((command.result or {}).get("runtime_epoch") or 0) or None,
-                    )
+                    failed_epoch = expected_epoch or int((command.result or {}).get("runtime_epoch") or 0)
+                    TradingExecutor._mark_stopped(command.strategy_id, expected_epoch=failed_epoch or None)
+                    self._cleanup_failed_start(command.strategy_id, failed_epoch)
         finally:
             self._lease_heartbeat.forget_command()
+
+    def _cleanup_failed_start(self, strategy_id: int, expected_epoch: int) -> None:
+        if expected_epoch:
+            request = self.repository.runtime_request(strategy_id)
+            if int(request.get("desired_runtime_epoch") or 0) != expected_epoch:
+                return
+        local = strategy_id in self._local_strategy_ids()
+        if not local and strategy_id not in self._lease_heartbeat.strategy_ids():
+            return
+        # Fence execution immediately, including a loader still inside blocking I/O.
+        # Do not revoke another owner's lease or cancel broker-side protection.
+        self._lease_heartbeat.forget_strategy(strategy_id)
+        stopped = not local or self.executor.stop_strategy(
+            strategy_id, persist_status=False, cancel_orders=False,
+        )
+        if stopped:
+            self.repository.release_strategy_lease(strategy_id=strategy_id, owner_id=self.worker_id)
+            clear_token = getattr(self.executor, "clear_runtime_fencing_token", None)
+            if callable(clear_token):
+                clear_token(strategy_id)
+        else:
+            logger.error("Failed startup runtime fenced; awaiting local exit: strategy=%s", strategy_id)
 
     def _start(self, strategy_id: int, *, wait_ready: bool = True) -> dict:
         from app.services.strategy import StrategyService
@@ -282,6 +330,14 @@ class TradingWorker:
         strategy = StrategyService().get_strategy(strategy_id)
         if not strategy or str(strategy.get("status") or "").lower() != "running":
             return {"strategy_id": strategy_id, "status": "skipped", "reason": "desired_state_changed"}
+        request = self.repository.runtime_request(strategy_id)
+        retry_at = float(request.get("startup_retry_at") or 0)
+        if float(request.get("retry_after_seconds") or 0) > 0:
+            return {
+                "strategy_id": strategy_id, "status": "starting", "reason": "marketData.rate_limited",
+                "runtime_epoch": int(strategy.get("desired_runtime_epoch") or 1),
+                "retry_after_seconds": float(request["retry_after_seconds"]), "startup_retry_at": retry_at,
+            }
         if self.distributed_bar_evaluation:
             from app.services.strategy_event_subscriptions import (
                 StrategyEventSubscriptionPlanner,
@@ -303,12 +359,13 @@ class TradingWorker:
                     "runtime_owner": "strategy-evaluator-group",
                     "status": "running" if request.get("ready") else "starting",
                     "runtime_epoch": int(strategy.get("desired_runtime_epoch") or 1),
+                    "startup_retry_at": float(request.get("startup_retry_at") or 0),
                     "trigger": "distributed_bar",
                 }
         if strategy_id in self._local_strategy_ids():
             ready, _hint = self.executor.wait_strategy_running(strategy_id, timeout=0.5)
             return {"strategy_id": strategy_id, "runtime_owner": self.worker_id,
-                    "status": "running" if ready else "starting"}
+                    "status": "running" if ready else "starting", "startup_retry_at": retry_at}
         if not self._acquire_runtime(strategy_id):
             if self._has_active_strategy_lease(strategy_id):
                 return {
@@ -334,9 +391,10 @@ class TradingWorker:
         alive, hint = self.executor.wait_strategy_running(strategy_id, timeout=3.0)
         if not alive:
             if strategy_id in self._local_strategy_ids():
-                return {"strategy_id": strategy_id, "runtime_owner": self.worker_id, "status": "starting"}
-            append_strategy_log(strategy_id, "error", "strategyRuntime.startFailed")
-            stopped = self.executor.stop_strategy(strategy_id, persist_status=False)
+                return {"strategy_id": strategy_id, "runtime_owner": self.worker_id, "status": "starting", "startup_retry_at": retry_at}
+            if not exchange_cooldown_seconds(hint):
+                append_strategy_log(strategy_id, "error", "strategyRuntime.startFailed")
+            stopped = self.executor.stop_strategy(strategy_id, persist_status=False, cancel_orders=False)
             if stopped:
                 self._lease_heartbeat.forget_strategy(strategy_id)
                 self.repository.release_strategy_lease(strategy_id=strategy_id, owner_id=self.worker_id)

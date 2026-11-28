@@ -93,8 +93,10 @@ def test_okx_subscribes_only_after_successful_login():
     ws = FakeSocket()
     assert adapter.handle_control(ws, {"event": "login", "code": "0"})
     assert ws.messages == [{"op": "subscribe", "args": [{"channel": "orders", "instType": "ANY"}]}]
+    assert not adapter.connected
+    adapter.handle_control(ws, {"event": "subscribe", "arg": {"channel": "orders", "instType": "ANY"}})
     assert adapter.connected
-    assert states == ["connected"]
+    assert states == ["subscribing", "connected"]
 
 
 def test_okx_and_bitget_use_literal_ping_and_bybit_uses_json_ping():
@@ -163,14 +165,23 @@ def test_binance_spot_uses_signed_websocket_api_subscription(monkeypatch, enviro
 
 
 @pytest.mark.parametrize(("environment", "rest_host", "ws_host"), (
-    ("live", "https://fapi.binance.com", "wss://fstream.binance.com/ws"),
-    ("demo", "https://demo-fapi.binance.com", "wss://fstream.binancefuture.com/ws"),
+    ("live", "https://fapi.binance.com", "wss://fstream.binance.com/private/ws"),
+    ("demo", "https://demo-fapi.binance.com", "wss://demo-fstream.binance.com/ws"),
+    ("testnet", "https://demo-fapi.binance.com", "wss://demo-fstream.binance.com/ws"),
 ))
 def test_binance_futures_retains_listen_key_subscription(monkeypatch, environment, rest_host, ws_host):
     adapter, _states = _adapter(BinanceExecutionAdapter)
     adapter.config["environment"] = environment
     calls = []
-    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"listenKey": "stream-key"})
+    from app.utils import binance_request_guard as guard_module
+
+    guard = guard_module.BinanceRequestGuard()
+    guard._redis_url = ""
+    monkeypatch.setattr(guard_module, "binance_request_guard", guard)
+    response = SimpleNamespace(
+        status_code=200, headers={}, text='{"listenKey":"stream-key"}',
+        raise_for_status=lambda: None, json=lambda: {"listenKey": "stream-key"},
+    )
     monkeypatch.setattr("app.services.execution_streams.adapters.requests.post", lambda url, **kw: calls.append((url, kw)) or response)
     adapter._keepalive_thread = SimpleNamespace(is_alive=lambda: True)
 
@@ -206,6 +217,29 @@ def test_binance_websocket_api_event_envelope_is_unwrapped():
     assert events[0].exchange_order_id == "12"
 
 
+def test_binance_private_futures_raw_order_event_preserves_fill_evidence():
+    adapter, _states = _adapter(BinanceExecutionAdapter)
+    adapter.config["environment"] = "live"
+    adapter._listen_key = "stream-key"
+    assert adapter.url() == "wss://fstream.binance.com/private/ws/stream-key"
+    payload = {
+        "e": "ORDER_TRADE_UPDATE", "E": 1_700_000_000_000,
+        "o": {
+            "s": "BTCUSDT", "i": 12, "t": 34, "c": "qd-1",
+            "S": "BUY", "ps": "LONG", "X": "FILLED", "x": "TRADE",
+            "L": "100", "l": "0.5", "z": "0.5", "n": "0.02", "N": "USDT",
+        },
+    }
+    assert adapter.handle_control(FakeSocket(), payload) is False
+    events = adapter.parse(payload)
+    assert len(events) == 1
+    assert events[0].exchange_order_id == "12"
+    assert events[0].quantity == 0.5
+    assert events[0].fee_status == "actual"
+    assert events[0].fees[0].currency == "USDT"
+    assert events[0].fees[0].amount == pytest.approx(0.02)
+
+
 def test_bitget_demo_and_live_use_matching_private_websocket_hosts():
     demo, _states = _adapter(BitgetExecutionAdapter)
     live, _states = _adapter(BitgetExecutionAdapter)
@@ -229,6 +263,8 @@ def test_bybit_subscribes_only_after_successful_authentication():
     ws = FakeSocket()
     adapter.handle_control(ws, {"op": "auth", "success": True})
     assert ws.messages == [{"op": "subscribe", "args": ["execution"]}]
+    assert not adapter.connected
+    adapter.handle_control(ws, {"op": "subscribe", "success": True})
     assert adapter.connected
 
 
@@ -250,6 +286,76 @@ def test_bitget_uses_uta_fill_subscription(market_type):
         "instType": "UTA",
         "topic": "fill",
     }
+    assert not adapter.connected
+    adapter.handle_control(ws, {"event": "subscribe", "arg": ws.messages[0]["args"][0]})
+    assert adapter.connected
+
+
+@pytest.mark.parametrize("mode,version", [("uta", "v3"), ("classic", "v2")])
+@pytest.mark.parametrize("market_type", ["spot", "swap"])
+def test_bitget_execution_uses_same_account_router_as_orders(monkeypatch, mode, version, market_type):
+    calls = []
+    fake = SimpleNamespace(bitget_account_mode=mode, _resolve_bitget_client=lambda: calls.append("resolve"))
+    monkeypatch.setattr("app.services.live_trading.factory.create_client", lambda config, **kw: fake)
+    adapter, _ = _adapter(BitgetExecutionAdapter, market_type=market_type)
+    adapter.prepare()
+    assert calls == ["resolve"]
+    assert f"/{version}/ws/private" in adapter.url()
+    ws = FakeSocket()
+    adapter.handle_control(ws, {"event": "login", "code": "0"})
+    arg = ws.messages[0]["args"][0]
+    if mode == "classic":
+        assert arg == {"instType": "SPOT" if market_type == "spot" else "USDT-FUTURES", "channel": "orders", "instId": "default"}
+    else:
+        assert arg == {"instType": "UTA", "topic": "fill"}
+    assert not adapter.connected
+    adapter.handle_control(ws, {"event": "subscribe", "arg": arg})
+    assert adapter.connected
+
+
+@pytest.mark.parametrize("adapter_cls,response", [
+    (OkxExecutionAdapter, {"event": "error", "code": "60012"}),
+    (BitgetExecutionAdapter, {"event": "error", "code": "30001"}),
+    (BybitExecutionAdapter, {"op": "subscribe", "success": False}),
+    (HtxExecutionAdapter, {"op": "sub", "err-code": 1000}),
+])
+def test_subscription_errors_do_not_report_ready_or_stop_strategy(adapter_cls, response):
+    adapter, states = _adapter(adapter_cls)
+    ws = FakeSocket()
+    adapter.handle_control(ws, response)
+    assert ws.closed
+    assert not adapter.connected
+    assert states == ["error"]
+    assert not adapter._stop.is_set()
+
+
+def test_htx_waits_for_both_futures_subscription_acknowledgements():
+    adapter, _ = _adapter(HtxExecutionAdapter)
+    ws = FakeSocket()
+    adapter.handle_control(ws, {"op": "auth", "err-code": 0})
+    adapter.handle_control(ws, {"op": "sub", "topic": "matchOrders.*", "err-code": 0})
+    assert not adapter.connected
+    adapter.handle_control(ws, {"op": "sub", "topic": "matchOrders_cross.*", "err-code": 0})
+    assert adapter.connected
+
+
+def test_private_subscription_timeout_recovers_without_stopping_strategy():
+    adapter, states = _adapter(OkxExecutionAdapter)
+    ws = FakeSocket()
+    adapter._check_readiness(ws)
+    assert ws.closed and states == ["error"]
+    assert not adapter._stop.is_set()
+
+
+@pytest.mark.parametrize("adapter_cls", [OkxExecutionAdapter, BitgetExecutionAdapter, BybitExecutionAdapter])
+def test_private_missing_pong_reconnects_without_stopping_strategy(monkeypatch, adapter_cls):
+    adapter, states = _adapter(adapter_cls)
+    ws = FakeSocket()
+    adapter._awaiting_pong_at = 1.0
+    monkeypatch.setattr("app.services.execution_streams.adapters.time.monotonic", lambda: 60.0)
+    adapter._application_heartbeat_loop(ws, StopAfterOneHeartbeat())
+    assert ws.closed and states == ["error"]
+    assert not adapter._stop.is_set()
 
 
 def test_gate_becomes_healthy_only_after_authenticated_subscription_ack():

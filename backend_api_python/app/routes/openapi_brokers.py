@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+from contextlib import nullcontext
 from typing import Any, Dict
 
 from flask import g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
-from app.services.openapi_brokers import TigerClient, TigerConfig, WebullClient, WebullConfig
+from app.services.openapi_brokers import TigerClient, TigerConfig, WebullClient, WebullConfig, ForthrightClient, ForthrightConfig
+from app.services.openapi_brokers.forthright import gateway_url, gateway_environment
 from app.utils.auth import login_required, trading_required
 from app.utils.broker_session import BrokerSessionRegistry
 from app.utils.credential_crypto import decrypt_credential_blob, encrypt_credential_blob
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.broker_order_validation import order_number
 from app.utils.trading_venue_visibility import is_trading_venue_enabled
 
 logger = get_logger(__name__)
 
 openapi_brokers_blp = Blueprint("openapi_brokers", __name__)
-_BROKERS = {"tiger", "webull"}
+_BROKERS = {"tiger", "webull", "forthright"}
 _sessions = {broker: BrokerSessionRegistry(broker) for broker in _BROKERS}
 _PUBLIC_ERROR_KEYS = {
     key: key
@@ -47,6 +51,13 @@ def _public_error(exc: BaseException, fallback: str) -> str:
     value = exc.args[0] if exc.args else None
     if not isinstance(value, str):
         return fallback
+    if value in {"brokerAccounts.forthright." + key for key in (
+        "invalidAccountType", "invalidEnvironment", "invalidPrivateKey", "gatewayRequired",
+        "closeOrdersPending", "positionChanged", "secondAuthRequired", "unlockRequired", "ipForbidden", "invalidSnapshot",
+        "executionUnknown", "serviceUnavailable", "marketSessionClosed", "lotUnavailable", "belowBoardLot", "wholeBoardLot",
+        "unsupportedMarket", "contractRequired", "referencePriceRequired", "contractMetadataRequired", "protectionUnsupported", "canonicalSymbolRequired",
+    )}:
+        return value
     return _PUBLIC_ERROR_KEYS.get(value, fallback)
 
 
@@ -111,7 +122,7 @@ def _load_config(user_id: int, broker: str) -> dict:
     try:
         payload = json.loads(decrypt_credential_blob(rows[0].get("encrypted_config")) or "{}")
     except Exception as exc:
-        logger.warning("Failed to decrypt %s credential: %s", broker, exc)
+        logger.warning("Failed to decrypt %s credential: %s", broker, type(exc).__name__)
         return {}
     if not isinstance(payload, dict):
         return {}
@@ -120,6 +131,20 @@ def _load_config(user_id: int, broker: str) -> dict:
 
 
 def _request_config(broker: str, data: dict) -> dict:
+    if broker == "forthright":
+        if str(data.get("currency") or "USD") not in {"USD", "HKD"}:
+            raise ValueError("brokerAccounts.invalidOrder")
+        return {
+            "exchange_id": broker,
+            "app_id": str(data.get("appId") or data.get("app_id") or "").strip(),
+            "account_id": str(data.get("accountId") or data.get("account_id") or "").strip(),
+            "private_key": str(data.get("privateKey") or data.get("private_key") or "").strip(),
+            "trade_password": str(data.get("tradePassword") or data.get("trade_password") or ""),
+            "account_type": str(data.get("accountType") or data.get("account_type") or "securities"),
+            "environment": str(data.get("environment") or "sandbox").strip().lower(),
+            "gateway_environment": str(data.get("environment") or "sandbox").strip().lower(),
+            "currency": str(data.get("currency") or "USD"),
+        }
     if broker == "tiger":
         tiger_id = str(data.get("tigerId") or data.get("tiger_id") or "").strip()
         account_id = str(data.get("accountId") or data.get("account_id") or "").strip()
@@ -161,6 +186,10 @@ def _request_config(broker: str, data: dict) -> dict:
 
 
 def _client(broker: str, config: dict):
+    if broker == "forthright":
+        return ForthrightClient(ForthrightConfig(**{
+            key: config[key] for key in ForthrightConfig.__dataclass_fields__ if key in config
+        }))
     if broker == "tiger":
         return TigerClient(TigerConfig(
             tiger_id=str(config.get("tiger_id") or ""),
@@ -178,13 +207,13 @@ def _client(broker: str, config: dict):
     ))
 
 
-def _save(user_id: int, broker: str, config: dict, name: str) -> int:
-    public_key = str(config.get("app_key") or config.get("tiger_id") or "")
+def _save(user_id: int, broker: str, config: dict, name: str, *, connection=None) -> int:
+    public_key = str(config.get("app_id") or config.get("app_key") or config.get("tiger_id") or "")
     account_id = str(config.get("account_id") or "")
     key = f"{public_key}:{account_id}"
     environment = str(config.get("environment") or "live")
     encrypted = encrypt_credential_blob(json.dumps(config, ensure_ascii=False))
-    with get_db_connection() as db:
+    with (nullcontext(connection) if connection is not None else get_db_connection()) as db:
         cur = db.cursor()
         cur.execute(
             """
@@ -197,15 +226,21 @@ def _save(user_id: int, broker: str, config: dict, name: str) -> int:
         for row in cur.fetchall() or []:
             try:
                 existing = json.loads(decrypt_credential_blob(row.get("encrypted_config")) or "{}")
-                existing_public_key = str(existing.get("app_key") or existing.get("tiger_id") or "")
+                existing_public_key = str(existing.get("app_id") or existing.get("app_key") or existing.get("tiger_id") or "")
                 existing_key = f"{existing_public_key}:{str(existing.get('account_id') or '')}"
-                if existing_key == key and str(existing.get("environment") or "live") == environment:
+                same_gateway = (gateway_url(existing) == gateway_url(config)) if broker == "forthright" else str(existing.get("environment") or "live") == environment
+                if (existing_key == key and same_gateway
+                        and existing.get("account_type") == config.get("account_type")):
                     target_id = int(row.get("id") or 0)
                     break
             except Exception:
                 continue
         key_hint = f"{_hint(public_key)} ({environment})"
+        if broker == "forthright":
+            key_hint = f"{_hint(public_key)} · {config.get('account_type')} · {account_id}"
         display_name = str(name or "").strip()[:100] or f"{broker.title()} {environment.title()}"
+        if broker == "forthright" and not str(name or "").strip():
+            display_name = f"Forthright {account_id}"
         if target_id:
             cur.execute(
                 """
@@ -226,7 +261,8 @@ def _save(user_id: int, broker: str, config: dict, name: str) -> int:
                 (int(user_id), display_name, broker, key_hint, encrypted),
             )
             credential_id = int((cur.fetchone() or {}).get("id") or 0)
-        db.commit()
+        if connection is None:
+            db.commit()
         cur.close()
     return credential_id
 
@@ -243,7 +279,7 @@ def _connected_client(broker: str):
             client.connect()
             _sessions[broker].set(client, credential_id)
         except Exception as exc:
-            logger.warning("%s reconnect failed: %s", broker, exc)
+            logger.warning("%s reconnect failed: %s", broker, type(exc).__name__)
             return None, (jsonify({
                 "success": False,
                 "error": _public_error(exc, "brokerAccounts.snapshotConnectionFailed"),
@@ -256,10 +292,16 @@ def _connected_client(broker: str):
 def accounts(broker: str):
     try:
         broker = _broker_id(broker)
-        return jsonify({"success": True, "data": [
-            {key: row.get(key) for key in ("id", "name", "api_key_hint")}
-            for row in _rows(int(g.user_id), broker)
-        ]})
+        result = []
+        for row in _rows(int(g.user_id), broker):
+            item = {key: row.get(key) for key in ("id", "name", "api_key_hint")}
+            if broker == "forthright":
+                cfg = json.loads(decrypt_credential_blob(row.get("encrypted_config")) or "{}")
+                item.update(account_type=cfg.get("account_type"), account_id=cfg.get("account_id"),
+                            environment=gateway_environment(cfg), gateway=gateway_url(cfg))
+                item["api_key_hint"] = f"{_hint(cfg.get('app_id'))} · {cfg.get('account_id', '')}"
+            result.append(item)
+        return jsonify({"success": True, "data": result})
     except ValueError as exc:
         return jsonify({"success": False, "error": _public_error(
             exc, "brokerAccounts.accountLoadFailed"
@@ -282,7 +324,7 @@ def status(broker: str):
                 client.connect()
                 _sessions[broker].set(client, credential_id)
             except Exception as exc:
-                logger.warning("%s status refresh failed: %s", broker, exc)
+                logger.warning("%s status refresh failed: %s", broker, type(exc).__name__)
                 return jsonify({"success": True, "data": {
                     "connected": False,
                     "saved": True,
@@ -307,6 +349,8 @@ def connect(broker: str):
         broker = _broker_id(broker)
         data = request.get_json(silent=True) or {}
         config = _request_config(broker, data)
+        if broker == "forthright" and not (data.get("accountType") or data.get("account_type")):
+            return _connect_forthright_accounts(config, str(data.get("name") or ""))
         client = _client(broker, config)
         client.connect()
         config["account_id"] = client.account_id
@@ -316,16 +360,36 @@ def connect(broker: str):
         status_data.update({"saved": True, "credential_id": credential_id})
         return jsonify({"success": True, "message": "brokerAccounts.connectSuccess", "data": status_data})
     except (ValueError, RuntimeError) as exc:
-        logger.warning("%s connection failed: %s", broker, exc)
+        logger.warning("%s connection failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": _public_error(
             exc, "brokerAccounts.snapshotConnectionFailed"
         )}), 400
-    except Exception:
-        logger.exception("Broker connection failed")
+    except Exception as exc:
+        logger.error("Broker connection failed (%s)", type(exc).__name__)
         return jsonify({
             "success": False,
             "error": "brokerAccounts.snapshotConnectionFailed",
         }), 500
+
+
+def _connect_forthright_accounts(config: dict, name: str):
+    discovered = _client("forthright", config).discover_accounts()
+    saved = []
+    clients = []
+    with get_db_connection() as db:
+        for account in discovered:
+            account_config = {**config, **account}
+            client = _client("forthright", account_config)
+            client.connected = True
+            label = f"{name.strip()} · {account['account_id']}" if name.strip() else ""
+            credential_id = _save(int(g.user_id), "forthright", account_config, label, connection=db)
+            saved.append({**client.get_connection_status(), "saved": True, "credential_id": credential_id})
+            clients.append((credential_id, client))
+        db.commit()
+    for credential_id, client in clients:
+        _sessions["forthright"].set(client, credential_id)
+    return jsonify({"success": True, "message": "brokerAccounts.connectSuccess",
+                    "data": {**saved[0], "accounts": saved}})
 
 
 @openapi_brokers_blp.route("/<broker>/disconnect", methods=["POST"])
@@ -344,6 +408,74 @@ def disconnect(broker: str):
         )}), 400
 
 
+def _record_forthright_authorization(client, state):
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute("SELECT encrypted_config FROM qd_exchange_credentials WHERE id = %s AND user_id = %s AND exchange_id = %s FOR UPDATE",
+                    (_credential_id(), int(g.user_id), "forthright"))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("brokerAccounts.accountUnavailable")
+        cfg = json.loads(decrypt_credential_blob(row["encrypted_config"]))
+        if gateway_url(cfg).rstrip("/") != client.base_url.rstrip("/"):
+            raise ValueError("brokerAccounts.accountUnavailable")
+        if any(cfg.get(key) != getattr(client.config, key) for key in
+               ("app_id", "account_id", "account_type", "private_key", "trade_password")):
+            raise ValueError("brokerAccounts.accountUnavailable")
+        observed = {"state": state, "checked_at": datetime.now(timezone.utc).isoformat()}
+        cfg["trade_authorization"] = observed
+        cur.execute("UPDATE qd_exchange_credentials SET encrypted_config = %s WHERE id = %s AND user_id = %s AND exchange_id = %s",
+                    (encrypt_credential_blob(json.dumps(cfg)), _credential_id(), int(g.user_id), "forthright"))
+        db.commit()
+        cur.close()
+    return observed
+
+
+@openapi_brokers_blp.route("/forthright/authorization", methods=["GET"])
+@login_required
+def forthright_authorization():
+    try:
+        cfg = _load_config(int(g.user_id), _broker_id("forthright"))
+        if not cfg:
+            raise ValueError("brokerAccounts.accountUnavailable")
+        return jsonify({"success": True, "data": cfg.get("trade_authorization") or {"state": "unknown"}})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.accountLoadFailed")}), 400
+
+
+@openapi_brokers_blp.route("/forthright/unlock", methods=["POST"])
+@login_required
+@trading_required
+def forthright_unlock():
+    try:
+        client, error = _connected_client(_broker_id("forthright"))
+        if error:
+            return error
+        data = request.get_json(silent=True) or {}
+        client.unlock(str(data.get("smsCode") or ""))
+        observed = _record_forthright_authorization(client, "verified")
+        return jsonify({"success": True, "data": {"unlocked": True, "authorization": observed}})
+    except Exception as exc:
+        if str(exc) in {"brokerAccounts.forthright.secondAuthRequired", "brokerAccounts.forthright.unlockRequired"}:
+            _record_forthright_authorization(client, "needs_sms" if str(exc).endswith("secondAuthRequired") else "unknown")
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.orderFailed")}), 400
+
+
+@openapi_brokers_blp.route("/forthright/contracts", methods=["GET"])
+@login_required
+def forthright_contracts():
+    try:
+        client, error = _connected_client(_broker_id("forthright"))
+        if error:
+            return error
+        from app.services.market.dated_futures import future_display_metadata, register_contract_catalog
+        rows = client.get_contracts(str(request.args.get("instrument_code") or ""))
+        register_contract_catalog(rows)
+        return jsonify({"success": True, "data": [{**row, **future_display_metadata(str(row.get("prodCode") or ""))} for row in rows]})
+    except Exception as exc:
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.accountLoadFailed")}), 400
+
+
 @openapi_brokers_blp.route("/<broker>/account", methods=["GET"])
 @login_required
 def account(broker: str):
@@ -352,10 +484,12 @@ def account(broker: str):
         client, error = _connected_client(broker)
         if error:
             return error
-        return jsonify({"success": True, "data": client.get_account_summary()})
+        extra = {"currency": request.args.get("currency")} if broker == "forthright" else {}
+        return jsonify({"success": True, "data": client.get_account_summary(**extra)})
     except Exception as exc:
-        logger.warning("%s account summary failed: %s", broker, exc)
-        return jsonify({"success": False, "error": "brokerAccounts.accountLoadFailed"}), 500
+        logger.warning("%s account summary failed: %s", broker, type(exc).__name__)
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.accountLoadFailed"),
+                        "broker_details": getattr(exc, "broker_details", None)}), 500
 
 
 @openapi_brokers_blp.route("/<broker>/positions", methods=["GET"])
@@ -368,7 +502,7 @@ def positions(broker: str):
             return error
         return jsonify({"success": True, "data": client.get_positions()})
     except Exception as exc:
-        logger.warning("%s positions request failed: %s", broker, exc)
+        logger.warning("%s positions request failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": "brokerAccounts.snapshotPositionsFailed"}), 500
 
 
@@ -386,7 +520,7 @@ def orders(broker: str):
             symbol=str(request.args.get("symbol") or ""),
         )})
     except Exception as exc:
-        logger.warning("%s orders request failed: %s", broker, exc)
+        logger.warning("%s orders request failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": "brokerAccounts.ordersLoadFailed"}), 500
 
 
@@ -399,28 +533,58 @@ def fills(broker: str):
         if error:
             return error
         data = None
-        if hasattr(client, "get_transactions"):
+        if hasattr(client, "get_transactions") and not (broker == "forthright" and client.is_futures):
             try:
                 data = client.get_transactions(
                     symbol=str(request.args.get("symbol") or ""),
                     limit=int(request.args.get("limit") or 100),
                 )
             except Exception as exc:
-                logger.info("Transaction history unavailable for %s; using filled orders: %s", broker, exc)
+                if broker == "forthright":
+                    raise
+                logger.info("Transaction history unavailable for %s; using filled orders: %s", broker, type(exc).__name__)
         if data is None:
             symbol = str(request.args.get("symbol") or "").strip().upper()
-            rows = client.get_orders(
-                status="filled",
-                limit=int(request.args.get("limit") or 100),
-                symbol=symbol,
-            )
-            data = [row for row in rows if str(row.get("status") or "").lower() == "filled"]
-            if symbol:
-                data = [row for row in data if str(row.get("symbol") or "").strip().upper() == symbol]
+            limit = min(max(int(request.args.get("limit") or 100), 1), 100)
+            rows = client.get_orders(status="all", limit=limit, symbol=symbol)
+            rows += client.get_orders(status="open", limit=limit, symbol=symbol)
+            executions = {}
+            for row in rows:
+                quantity = float(row.get("filled_qty") or 0)
+                key = str(row.get("id") or row.get("order_id") or "")
+                if quantity <= 0 or not key:
+                    continue
+                previous = executions.get(key)
+                if previous is None or quantity >= float(previous.get("filled_qty") or 0):
+                    executions[key] = row
+            data = list(executions.values())
+            if symbol and broker != "forthright":
+                from app.services.openapi_brokers.symbols import equity_symbols_match
+                data = [row for row in data if equity_symbols_match(row.get("symbol"), symbol)]
+            data.sort(key=lambda row: str(row.get("filled_at") or row.get("submitted_at") or ""), reverse=True)
+            data = data[:limit]
         return jsonify({"success": True, "data": data})
     except Exception as exc:
-        logger.warning("%s fills request failed: %s", broker, exc)
+        logger.warning("%s fills request failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": "brokerAccounts.ordersLoadFailed"}), 500
+
+
+@openapi_brokers_blp.route("/<broker>/instrument-rules", methods=["GET"])
+@login_required
+def forthright_instrument_rules(broker="forthright"):
+    try:
+        broker = _broker_id(broker)
+        if broker not in {"forthright", "tiger"}:
+            raise ValueError("brokerAccounts.forthright.unsupportedMarket")
+        client, error = _connected_client(broker)
+        if error:
+            return error
+        from app.services.market.hk_board_lots import board_lot_rule
+        symbol = str(request.args.get("symbol") or "")
+        rule = client.get_instrument_rules(symbol) if broker == "forthright" else board_lot_rule(symbol)
+        return jsonify({"success": True, "data": rule})
+    except Exception as exc:
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.forthright.lotUnavailable")}), 400
 
 
 @openapi_brokers_blp.route("/<broker>/order", methods=["POST"])
@@ -436,18 +600,33 @@ def place_order(broker: str):
         symbol = str(data.get("symbol") or "").strip()
         side = str(data.get("side") or "").strip().lower()
         order_type = str(data.get("orderType") or data.get("order_type") or "market").strip().lower()
-        quantity = float(data.get("quantity") or data.get("size") or 0)
-        price = float(data.get("price") or data.get("limitPrice") or 0)
+        quantity = order_number(
+            order_number(data.get("quantity"), allow_zero=True)
+            or order_number(data.get("size"), allow_zero=True)
+        )
+        if broker == "forthright" and any(data.get(key) for key in (
+            "take_profit_price", "stop_loss_price", "takeProfitPrice", "stopLossPrice",
+        )):
+            raise ValueError("brokerAccounts.forthright.protectionUnsupported")
+        price = order_number(data.get("price"), allow_zero=True) or order_number(data.get("limitPrice"), allow_zero=True)
+        price = order_number(price, allow_zero=order_type != "limit")
+        extra = {}
+        if broker == "forthright":
+            extra["reference_price"] = (
+                order_number(data.get("referencePrice"), allow_zero=True)
+                or order_number(data.get("reference_price"), allow_zero=True)
+                or price
+            )
         if not symbol or side not in ("buy", "sell") or quantity <= 0:
             raise ValueError("brokerAccounts.invalidOrder")
         if order_type == "limit":
             if price <= 0:
                 raise ValueError("brokerAccounts.invalidLimitPrice")
             result = client.place_limit_order(symbol=symbol, side=side, quantity=quantity, price=price,
-                                                market_type=str(data.get("marketType") or "USStock"))
+                                                market_type=str(data.get("marketType") or "USStock"), **extra)
         elif order_type == "market":
             result = client.place_market_order(symbol=symbol, side=side, quantity=quantity,
-                                                 market_type=str(data.get("marketType") or "USStock"))
+                                                 market_type=str(data.get("marketType") or "USStock"), **extra)
         else:
             raise ValueError("brokerAccounts.unsupportedOrderType")
         return jsonify({"success": result.success, "message": result.message, "data": {
@@ -462,10 +641,10 @@ def place_order(broker: str):
             exc, "brokerAccounts.orderFailed"
         )}), 400
     except Exception as exc:
-        logger.warning("%s order failed: %s", broker, exc)
+        logger.warning("%s order failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": _public_error(
             exc, "brokerAccounts.orderFailed"
-        )}), 502
+        ), "broker_details": getattr(exc, "broker_details", None)}), 502
 
 
 @openapi_brokers_blp.route("/<broker>/order/<order_id>", methods=["DELETE"])
@@ -479,7 +658,43 @@ def cancel_order(broker: str, order_id: str):
             return error
         return jsonify({"success": bool(client.cancel_order(order_id)), "message": "brokerAccounts.cancelRequested"})
     except Exception as exc:
-        logger.warning("%s order cancellation failed: %s", broker, exc)
+        logger.warning("%s order cancellation failed: %s", broker, type(exc).__name__)
         return jsonify({"success": False, "error": _public_error(
             exc, "brokerAccounts.orderFailed"
         )}), 502
+
+
+@openapi_brokers_blp.route("/forthright/close-position", methods=["POST"])
+@login_required
+@trading_required
+def close_forthright_position():
+    try:
+        client, error = _connected_client(_broker_id("forthright"))
+        if error:
+            return error
+        data = request.get_json(silent=True) or {}
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s), hashtext(%s)) AS locked",
+                        (f"forthright-close:{client.base_url}", client.account_id))
+            locked = (cur.fetchone() or {}).get("locked")
+            cur.close()
+            if not locked:
+                raise ValueError("brokerAccounts.forthright.closeOrdersPending")
+            result = client.close_futures_position(data.get("symbol"), data.get("expected_quantity"))
+            db.commit()
+        return jsonify({"success": result.success, "message": result.message,
+                        "data": {"orderId": result.order_id, "status": result.status}})
+    except Exception as exc:
+        return jsonify({"success": False, "error": _public_error(exc, "brokerAccounts.orderFailed"),
+                        "broker_details": getattr(exc, "broker_details", None)}), 400 if isinstance(exc, ValueError) else 502
+
+
+@openapi_brokers_blp.after_request
+def protect_credential_response(response):
+    from app.utils.structured_redaction import redact_structured_secrets
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Pragma'] = 'no-cache'
+    if response.is_json:
+        response.set_data(json.dumps(redact_structured_secrets(response.get_json()), ensure_ascii=False))
+    return response

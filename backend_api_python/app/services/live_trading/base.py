@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 
 import requests
 
+from app.utils.binance_request_guard import binance_request_guard, traced_binance_request
+
 from app.services.live_trading.http_transport import get_exchange_http_session
 from app.utils.resource_guard import (
     ResourceExhaustedError,
@@ -188,9 +190,16 @@ class BaseRestClient:
         try:
             assert_fd_available("exchange REST")
             request_headers = dict(headers or {})
+            from app.utils.exchange_request_guard import exchange_request_guard
+
+            scope = exchange_request_guard.before_request(url, method_name, headers=request_headers, params=params)
+            binance_request_guard.before_request(
+                url, method_name,
+                public=not any(str(key).lower() == "x-mbx-apikey" for key in request_headers),
+            )
             session = getattr(self, "_request_session", None) or get_exchange_http_session()
             request_headers.setdefault("Connection", "keep-alive")
-            with session.request(
+            with traced_binance_request(lambda: session.request(
                     method=method_name,
                     url=url,
                     params=params or None,
@@ -200,14 +209,16 @@ class BaseRestClient:
                     timeout=self.timeout_sec,
                     verify=_get_requests_verify(),
                     proxies=_get_proxies(),
-            ) as resp:
+            ), url, method_name) as resp:
                 status_code = int(resp.status_code)
                 text = resp.text or ""
+                binance_request_guard.observe(url, status_code, getattr(resp, "headers", {}), text)
                 parsed: Dict[str, Any] = {}
                 try:
                     parsed = resp.json() if text else {}
                 except Exception:
                     parsed = {"raw_text": text[:2000]}
+                exchange_request_guard.observe(scope, status_code, getattr(resp, "headers", {}), text, parsed)
                 return status_code, parsed, text
         except UnicodeEncodeError as e:
             # requests/http.client requires header values to be latin-1 encodable.

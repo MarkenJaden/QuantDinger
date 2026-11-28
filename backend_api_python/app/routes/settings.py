@@ -67,6 +67,7 @@ STRATEGY_RUNTIME_SETTINGS = {
 }
 
 TRADING_RUNTIME_SETTINGS = {
+    'EQUITY_QUOTE_MAX_AGE_MINUTES',
     'MAKER_WAIT_SEC',
     'MAKER_OFFSET_BPS',
     'AGENT_LIVE_TRADING_ENABLED',
@@ -786,6 +787,16 @@ CONFIG_SCHEMA = {
         'icon': 'stock',
         'order': 3,
         'items': [
+            {
+                'key': 'EQUITY_QUOTE_MAX_AGE_MINUTES',
+                'label': 'settings.field.EQUITY_QUOTE_MAX_AGE_MINUTES',
+                'type': 'number',
+                'default': '16',
+                'min': 1,
+                'max': 60,
+                'precision': 0,
+                'description': 'settings.desc.EQUITY_QUOTE_MAX_AGE_MINUTES'
+            },
             {
                 'key': 'AGENT_LIVE_TRADING_ENABLED',
                 'label': 'settings.field.AGENT_LIVE_TRADING_ENABLED',
@@ -2122,11 +2133,41 @@ def get_brand_config():
     Empty ENV values fall back to the bundled QuantDinger defaults so a fresh
     install still ships with working links instead of blanks.
     """
+    config = build_brand_config()
+    try:
+        from app.services.settings.advertisements import public_advertisements
+        config['advertisements'] = public_advertisements()
+    except Exception:
+        logger.warning('Advertisement configuration unavailable', exc_info=True)
+        config['advertisements'] = []
     return jsonify({
         'code': 1,
         'msg': 'success',
-        'data': build_brand_config()
+        'data': config
     })
+
+
+@settings_blp.route('/advertisements', methods=['GET', 'PUT'])
+@login_required
+@admin_required
+def advertisements():
+    from app.services.settings.advertisements import read_advertisements, save_advertisements
+    try:
+        if request.method == 'GET':
+            data = read_advertisements()
+        else:
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                raise ValueError('advertisements.invalid')
+            data = save_advertisements(payload.get('items'), payload.get('revision'))
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except ValueError as exc:
+        if str(exc) == 'advertisements.conflict':
+            return jsonify({'code': 0, 'msg': 'advertisements.conflict', 'data': None}), 409
+        return jsonify({'code': 0, 'msg': 'advertisements.invalid', 'data': None}), 400
+    except Exception:
+        logger.exception('Advertisement settings request failed')
+        return jsonify({'code': 0, 'msg': 'advertisements.failed', 'data': None}), 500
 
 
 @settings_blp.route('/values', methods=['GET'])
@@ -2177,7 +2218,7 @@ def get_market_catalog():
 @login_required
 @admin_required
 def sync_market_catalog():
-    """Start a non-blocking full sync for the supported crypto venues."""
+    """Start a non-blocking sync of venue products and instrument specifications."""
     try:
         from app.services.market_catalog_sync import start_market_catalog_sync
         result = start_market_catalog_sync('manual')
@@ -2191,6 +2232,23 @@ def sync_market_catalog():
     except Exception as exc:
         logger.error("Failed to start market catalog sync: %s", exc, exc_info=True)
         return jsonify({'code': 0, 'msg': str(exc)}), 500
+
+
+@settings_blp.route('/instrument-catalog', methods=['GET'])
+@login_required
+@admin_required
+def instrument_catalog():
+    from app.services.market.instrument_catalog import list_instrument_catalog
+    try:
+        data = list_instrument_catalog(request.args.get('market', 'Futures'),
+                                       request.args.get('keyword', ''),
+                                       request.args.get('page', 1), request.args.get('page_size', 30))
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except ValueError:
+        return jsonify({'code': 0, 'msg': 'brokerAccounts.invalidOrder'}), 400
+    except Exception:
+        logger.exception('Instrument catalog read failed')
+        return jsonify({'code': 0, 'msg': 'brokerAccounts.positionsLoadFailed'}), 500
 
 
 @settings_blp.route('/save', methods=['POST'])
@@ -2239,6 +2297,15 @@ def save_settings():
                             updates[key] = ''
                     else:
                         updates[key] = str(new_value)
+
+        if 'EQUITY_QUOTE_MAX_AGE_MINUTES' in updates:
+            from app.services.strategy_runtime.price_freshness import parse_equity_quote_max_age_minutes
+            try:
+                updates['EQUITY_QUOTE_MAX_AGE_MINUTES'] = str(parse_equity_quote_max_age_minutes(
+                    updates['EQUITY_QUOTE_MAX_AGE_MINUTES']
+                ))
+            except (TypeError, ValueError):
+                return jsonify({'code': 0, 'msg': 'settings.invalidEquityQuoteMaxAge'}), 400
 
         if 'REFERRAL_REWARD_RATES' in updates:
             try:

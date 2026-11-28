@@ -1,5 +1,7 @@
 # Strategy API V2 策略开发指南
 
+> 当前方德期货仅开放手动交易；期货自动策略下单暂时关闭。下文点值与合约映射说明保留供后续接入。
+
 > 适用范围：当前 QuantDinger 可执行策略契约 Strategy API V2
 > 面向读者：第一次编写策略的用户、指标转策略用户，以及需要同时覆盖回测与实盘的策略开发者
 
@@ -159,6 +161,10 @@ Content-Type: application/json
 | 莫斯科交易所 | <code>MOEX:SBER</code> |
 
 系统也会规范化部分别名，例如 <code>600519.XSHG</code> → <code>CNStock:600519.SH</code>、<code>BTCUSDT</code> → <code>BTC/USDT</code>。
+
+在明确的港股市场上下文中，纯数字和 HK 前缀别名会统一为五位数字加 <code>.HK</code>。动态股票池成分在行情、策略回调、部署校验和执行中使用同一标识，重复别名合并时保留历史成分区间，不改写公共股票池的原始记录。该规范化不适用于 Crypto 通道的股票产品或期货合约。
+
+该规则覆盖所有 HKStock 股票池：恒生指数（<code>hk_hsi</code>）、恒生科技（<code>hk_tech30</code>）、国企指数（<code>hk_china_enterprises50</code>）、港股通（<code>hk_stock_connect</code>）、ETF（<code>hk_etf</code>）、自定义池及自选列表。股票池和指数仍按时间解析成分；历史行情、因子、持仓和下单均原样使用 <code>get_universe_stocks()</code> / <code>get_index_stocks(...)</code> 返回的规范标识，不截掉市场前缀或 <code>.HK</code>，也不将当前成分硬编码为固定列表。统一标识不会补造历史数据、放宽券商支持范围或绕过每手股数校验。<code>USStock:BRK.B</code> 等美股类别代码保持不变。产品目录的底层股票元数据可以保留 <code>00700</code>，但不能用它替换交易所产品的执行标识。
 
 券商交易的证券统一使用 <code>Market:Symbol</code> 作为策略层规范身份。<code>USStock</code>、<code>HKStock</code>、<code>CNStock</code>、<code>Forex</code>、<code>Futures</code> 和 <code>MOEX</code> 标的后面不要添加 <code>@NASDAQ</code>、<code>@NYSE</code>、<code>@HKEX</code> 或 <code>@spot</code>。运行时会把券商、上市地点等执行元数据单独保存。普通 Crypto 策略源码只使用产品类型后缀 <code>@spot</code> 或 <code>@swap</code>；创建实盘部署时由所选账户凭证提供执行交易所，平台再解析该交易所上的对应产品。只有主动锁定交易所路由，或保留产品目录返回的交易所专属产品时，才使用 <code>@venue:market_type</code>。一旦源码显式指定交易所，该交易所就是数据和执行身份的一部分，系统不能静默替换。
 
@@ -781,7 +787,7 @@ def handle_data(context, data):
 
 券商股票实盘的价格保护和交易回调只在交易所常规交易时段求值，包含节假日、夏令时、提前收盘和午休规则。盘外报价不会锁定运行时止盈止损；开盘后按最新价格与持仓重新判断。尚未提交的订单不能跨收盘或午休补发，会在本地失效。券商已经接受的订单、原生保护单和提交结果未知的订单仍继续对账。本规则不改变加密货币交易。
 
-股票实盘报价还必须携带行情源的原始时间，属于当前连续交易时段，且不晚于当前时间、距当前不超过 90 秒。命中缓存不会刷新这个时间；价格数值未变化但时间有效的报价仍可使用。缺少时间、过期或上一交易时段的报价可以展示，但不参与自动止盈止损和日线调仓，待有效报价恢复后重新判断。正常休市不因此标记为行情异常；回测和仅通知模式不受此校验影响。
+股票实盘报价必须携带行情源的原始时间，属于当前连续交易时段，且不晚于当前时间、距当前不超过 `EQUITY_QUOTE_MAX_AGE_MINUTES`。在“系统设置 → 实盘交易 → 报价最大允许延迟（分钟）”中设置，范围为 1–60 的整数，默认 16 分钟；保存后需重启交易及策略运行 Worker。默认值允许使用 15 分钟延迟行情，但延迟价格可能导致本地止盈止损触发滞后，并与实际成交价不同。股票接收缓存使用相同有效期，命中缓存不会刷新行情源时间。缺少时间、过期或上一交易时段的报价不参与自动止盈止损和日线调仓，待有效报价恢复后重新判断。正常休市不因此标记为行情异常；回测、加密货币和仅通知模式的规则不变。
 
 ---
 
@@ -1068,7 +1074,9 @@ def rebalance(context, data):
 | 交易所股票永续 | Binance、OKX、Bitget、Bybit、Gate | <code>stock_perpetual / swap / swap</code>；属于衍生品，遵守 Crypto swap 方向和杠杆规则，必须使用准确原生合约 |
 | Binance bStocks | Binance | <code>tokenized_equity / spot / spot</code>；必须使用目录中的准确交易对（如 <code>NVDAB/USDT</code>），按普通现货下单且不可使用杠杆 |
 | 未验证交易所股票 | HTX | 在权威产品元数据和执行 API family 验证完成前拒绝 |
-| USStock | Alpaca、IBKR | 当前券商策略按 long-only |
+| USStock | Alpaca、IBKR、Tiger、Webull、方德 | 当前券商策略按 long-only |
+| HKStock | Tiger、方德 | 仅做多 |
+| Futures | 无 | 自动策略下单暂未开放；方德仅支持手动交易 |
 | 其他可解析市场 | 暂无 | 可回测或有数据不等于支持实盘 |
 
 混合市场 live 不支持，其他市场不能强行用不匹配的凭证部署。一个实盘资金分配还必须保持兼容的计价/结算币种和 API family；例如不能因为底层都是港股公司，就把 HKD Gate 直接股票和 USDT 股票永续放进同一资金池。

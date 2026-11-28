@@ -1,6 +1,20 @@
 # Live-trading safety guide
 
+> Forthright futures currently support manual trading only. Automated futures strategy execution is disabled; contract specification notes below are retained for future integration.
+
 This guide defines the minimum checks before moving from backtest or signal mode to real capital. Venue, broker, region, and account type affect available products; the active catalog and account response take precedence over static examples.
+
+## Quick Trade quantity conversion
+
+Quick Trade rejects quote-amount orders with HTTP 400 when it cannot obtain a positive, finite conversion price or calculate a positive, finite base quantity. It never treats the input USDT amount as a base-asset quantity on failure. Rejection happens before derivative account configuration and order submission; no order is automatically retried. Valid limit prices and recent reference prices retain their existing conversion paths. Spot orders explicitly entered in base quantity retain their separate sizing path. Deploy the backend fix for enforcement and the desktop/mobile locale updates for the translated rejection message; no database migration is required.
+
+## Strategy order numeric validation
+
+Live strategy sizing and the order queue reject non-finite quantities, prices and sizing inputs. Quote-to-base conversion rejects overflow and nonzero amounts that underflow to zero, instead of treating them as a flat target. Entry budget checks also reject non-finite balances, positions and calculated limits. Grid sizing skips invalid conversions and invalid normalized quantities before submission. Explicit zero targets and zero-quantity close-all requests retain their exit semantics; exits are not subject to the entry budget cap. These checks apply across the venues using the shared strategy gateway. Deploy the backend and trading workers together; no database migration is required.
+
+## Broker order numeric validation
+
+Alpaca, IBKR, Tiger, Webull and Forthright validate order numbers at both the HTTP entry point and the broker adapter. Required quantities, notionals and limit prices must be positive and finite; optional protection prices may be zero when disabled. NaN, infinity, negative values, booleans and malformed numbers are rejected locally. Alpaca limit-notional conversion also rejects overflow and quantities that round to zero. IBKR bracket orders and Alpaca attached protection validate their inputs before submitting the parent order. Existing share precision, HK board-lot rules and supported notional orders remain in effect. Deploy the backend and any trading workers using these adapters together; no migration is required.
 
 ## Support boundary
 
@@ -11,8 +25,9 @@ This guide defines the minimum checks before moving from backtest or signal mode
 | Exchange tokenized equities | OKX, Bybit, Bitget Reality | catalog and regional availability required; long-only |
 | Exchange equity perpetuals | Binance, OKX, Bitget, Bybit, Gate | derivative exposure; exact native contract and swap rules required |
 | Binance bStocks | Binance | exact catalog pair, spot semantics, and no leverage |
-| USStock | Alpaca, IBKR, Futu/Moomoo OpenD, Webull OpenAPI | current broker strategy policy is long-only |
-| HKStock | Futu/Moomoo OpenD | current broker strategy policy is long-only |
+| USStock | Alpaca, IBKR, Tiger, Webull, Forthright | current broker strategy policy is long-only |
+| HKStock | Tiger, Forthright | current broker strategy policy is long-only |
+| Futures | none | automated strategy execution is disabled; Forthright manual trading only |
 | Other parsed markets | none | data or backtest support does not imply live support |
 
 HTX equity products are rejected until authoritative metadata and an execution contract are available. Mixed-market live deployment is unsupported. See [Section 18 of the Strategy API V2 guide](STRATEGY_DEV_GUIDE.md#18-deployment-and-live-boundaries) for canonical identifiers and the full boundary.
@@ -48,6 +63,24 @@ Active results are refreshed after 30 seconds without hiding the last timestampe
 Confirmed zero-fill cancellations use a guarded local update; concurrent local fills prevent that update. Verification never posts trades, changes positions/cells, starts a runner or submits/cancels exchange orders. Running grids retain their existing poller/actor accounting owner. A partial/full fill not yet posted locally remains visibly pending; for a stopped grid it requires operator review, not automatic repair from this panel. No orders or holdings are deleted by verification. Contract tests cover ordinary spot and USDT swaps for Binance, OKX, Bitget (Classic/UTA), Bybit, Gate and HTX; this is not a live-account certification or support for every product family.
 
 Deploy the updated backend and trading workers together, followed by the desktop frontend for queued/pending/terminal labels. No database migration is required. This path repairs recoverable evidence; it cannot reconstruct records already removed by the exchange's history-retention policy.
+
+## Startup and worker recovery
+
+`STRATEGY_RUNTIME_STARTUP_TIMEOUT_SECONDS` bounds startup readiness polling per
+command (default 900 seconds, minimum 60). It includes historical-data
+loading and is separate from the sandbox callback timeout. Pending readiness
+polls retain the clock even when another controller claims them. Only takeover
+of an expired processing claim by a different worker resets the clock. Restart
+trading workers after changing this environment setting.
+
+Polling runtimes expose readiness before their first risk or signal cycle.
+Deferring a startup command stops its command heartbeat before returning it to
+pending. A terminal startup failure fences and cancels the local runtime without
+submitting closes or cancelling broker orders; an owned runtime lease is released
+after local exit, or allowed to expire if local shutdown times out. Existing
+orders and positions still require reconciliation. Deploy the worker fix before
+starting a previously failed strategy again; do not repair this state by deleting
+lease rows. No database migration is required.
 
 ## While running
 
@@ -143,9 +176,31 @@ The queue boundary and each broker submission attempt check the session again. A
 
 Orders already accepted by a broker, including native brackets, remain broker-managed. Ambiguous submissions retain their client IDs and reconciliation path; this guard neither cancels them nor marks them unsubmitted. Existing broker orders from before deployment must be checked at the broker before assuming they cannot execute at the next open.
 
-Broker-equity runtime prices retain the provider's observation timestamp through quote caching. Automatic protection and portfolio risk use prices only when that timestamp is known, no later than the evaluation time, at most 90 seconds old, and within the current regular-session segment. The 90-second bound accommodates quotes derived from one-minute bars, whose timestamps identify the minute's beginning. Repeated requests or cache hits never renew observation time; unchanged prices with genuinely current timestamps remain usable. An untimed or delayed provider response may remain visible in market-data screens but cannot trigger these live exits. Missing data does not cancel broker-accepted orders or stop reconciliation. Crypto and signal-mode price policies are unchanged.
+Broker-equity runtime prices retain the provider's observation timestamp through quote caching. Automatic protection, portfolio risk and daily rebalancing use prices only when that timestamp is known, no later than the evaluation time, within the configured maximum age, and within the current regular-session segment. **System Settings → Live Trading → Maximum quote age (minutes)** controls `EQUITY_QUOTE_MAX_AGE_MINUTES`: an integer from 1 to 60, default 16. The default accommodates 15-minute delayed feeds; it does not make them real-time. Delayed prices can delay local stops and differ from execution prices. Equity receipt-cache expiry uses the same window, so the shorter crypto receipt timeout does not override it. Repeated requests or cache hits never renew the provider timestamp. Missing, future, out-of-session or expired prices remain blocked; missing data does not cancel broker-accepted orders or stop reconciliation. With a delayed feed, the start of a regular-session segment may still wait until quotes from that segment arrive. Save the setting and restart the trading/runtime workers to apply it consistently across processes. Crypto and signal-mode price policies are unchanged; no database migration is required.
+
+## Large equity universes and market-data diagnosis
+
+Live US/HK daily warmup accepts the declared number of distinct, valid OHLC bars even when a newer listing does not cover the full padded calendar lookback. This exception is limited to runtime warmup; historical backtests still require their requested window. Latest completed-session checks, warmup readiness, and execution-quote freshness remain enforced. A successful HTTP response does not prove that a candle is current.
+
+Daily runtime requests share normalized start dates and completed-session cutoffs across startup clocks. The process cache retains up to `STRATEGY_SHARED_FRAME_CACHE_MAX_SIZE` streams (default 4096), subject to `STRATEGY_SHARED_FRAME_CACHE_MAX_BYTES` (default 256 MiB). Each worker has its own bound. Redis reuse still depends on cache configuration and expiration; this is not a durable historical-data store. Crypto and intraday window rules are unchanged.
+
+HK candle-provider exceptions now permit the next configured fallback. Tencent HTTP 403/429/501 responses open a 60-second process-local cooldown to avoid repeating blocked requests for every stock in a large pool. Already in-flight requests may still fail. No fallback fabricates candles, and public-provider availability or licensed coverage is not guaranteed by this mechanism.
+
+For daily live evaluation, `Daily signal waiting for fresh quotes` lists missing symbols, provider sources and observation ages (up to ten examples). Recovery is logged separately. `Daily signal evaluated` reports the completed signal session and intent count, including zero. Intent count is before broker submission and does not mean filled orders. Compare the same source, parameters, completed session **and strategy-owned positions** when investigating different accounts: a held stock may qualify for continued allocation while an empty account has no new-entry signal. These changes require updated strategy workers; no database migration is needed.
+
+## Binance REST request coordination
+
+Binance public market data and private REST clients share a request guard. With the standard Compose deployment it uses jobs Redis; standalone processes without a configured Redis endpoint use process-local coordination only. `BINANCE_REST_REDIS_URL` overrides the endpoint. All QuantDinger processes/deployments sharing an outbound IP must use the same Redis endpoint and `BINANCE_REST_NAMESPACE`. A configured coordinator outage defers requests rather than falling back to unlimited traffic. Other software using the same IP is outside this guard.
+
+Market data/fee queries and account reads have separate shared budgets, each defaulting to `BINANCE_REST_READS_PER_SECOND=5`. Brief congestion waits at most two seconds; longer waits return a retryable rate-limit error without sending HTTP. These are conservative request-count budgets, not a complete model of Binance endpoint weights. `X-MBX-USED-WEIGHT-1M` at `BINANCE_REST_WEIGHT_SOFT_LIMIT=1800` defers reads until the next minute. Writes do not consume these read budgets, and successful write responses are preserved even if publishing the weight feedback fails. There are no new automatic write retries.
+
+HTTP 429/418 establishes a shared cooldown for all Binance REST traffic, including writes, based on `Retry-After` and any `banned until` timestamp (the longer deadline wins). Without a server deadline the fallback is 60/120 seconds respectively, plus one second of margin. Live hosts share a conservative scope; demo/test hosts are separate. Existing bans must still expire at Binance. Fee reconciliation remains pending and does not perform immediate retry loops; K-line retrieval does not repeatedly retry the same limited venue or label the symbol invalid. Futures execution requests the account's mark price first and fetches a generic quote only if it is unavailable.
+
+Restart affected backend/market-data/trading workers after deploying or changing these environment settings. No migration is required. This guard reduces avoidable load; it cannot guarantee exchange availability or provide local stop execution while quotes/account REST are unavailable.
 
 ## Incident response
+
+For non-Binance REST coordination and official venue references, see [Exchange REST limits](EXCHANGE_REST_LIMITS.md).
 
 1. Stop new entries and additions.
 2. Record deployment, account, instrument, order IDs, timestamps, and errors.

@@ -29,7 +29,7 @@ class AlpacaOrderSyncPersistenceMixin:
                             dispatch_note = 'alpaca_fill_sync:requeued_stale_sync',
                             updated_at = NOW()
                         WHERE status = 'syncing'
-                          AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull')
+                          AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull', 'forthright')
                           AND updated_at < NOW() - (%s * INTERVAL '1 second')
                         """,
                         (stale_sec,),
@@ -48,7 +48,7 @@ class AlpacaOrderSyncPersistenceMixin:
                                 COALESCE((SELECT SUM(t.amount) FROM qd_strategy_trades t
                                           WHERE t.pending_order_id = pending_orders.id), 0))
                             OR (
-                                status = 'filled'
+                                status IN ('filled', 'cancelled')
                                 AND COALESCE(filled, 0) > 0
                                 AND updated_at < NOW() - (%s * INTERVAL '1 second')
                                 AND EXISTS (
@@ -59,7 +59,7 @@ class AlpacaOrderSyncPersistenceMixin:
                                 )
                             )
                           )
-                      AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull')
+                      AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull', 'forthright')
                       AND (
                             COALESCE(exchange_order_id, '') <> ''
                             OR COALESCE(client_order_id, '') <> ''
@@ -96,7 +96,7 @@ class AlpacaOrderSyncPersistenceMixin:
                                 COALESCE((SELECT SUM(t.amount) FROM qd_strategy_trades t
                                           WHERE t.pending_order_id = pending_orders.id), 0))
                             OR (
-                                status = 'filled'
+                                status IN ('filled', 'cancelled')
                                 AND COALESCE(filled, 0) > 0
                                 AND updated_at < NOW() - (%s * INTERVAL '1 second')
                                 AND EXISTS (
@@ -107,7 +107,7 @@ class AlpacaOrderSyncPersistenceMixin:
                                 )
                             )
                           )
-                      AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull')
+                      AND LOWER(COALESCE(exchange_id, '')) IN ('alpaca', 'tiger', 'webull', 'forthright')
                       AND (COALESCE(exchange_order_id, '') <> '' OR COALESCE(client_order_id, '') <> '')
                     RETURNING *
                     """,

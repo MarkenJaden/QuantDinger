@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -32,11 +33,14 @@ from app.services.market_context import (
 )
 from app.services.market_schedule import equity_order_session_error
 from app.services.strategy_runtime.health import record_runtime_heartbeat
-from app.services.strategy_runtime.price_freshness import filter_execution_prices
+from app.services.strategy_runtime.price_freshness import (
+    filter_execution_prices, daily_signal_wait_reason, execution_price_age_limit,
+)
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
 from app.services.strategy_runtime.order_intents import OrderIntentService
 from app.services.strategy_runtime.scheduler import CooperativeRuntimeScheduler
 from app.services.strategy_runtime.state import RuntimeStateStore
+from app.services.strategy_runtime.cooldown import exchange_cooldown_seconds
 from app.services.pending_orders.rebalance_batches import rebalance_batch
 from app.services.strategy_runtime.live_portfolio import refresh_members, positions_by_symbol, available_strategy_cash, pricing_members
 from app.services.strategy_runtime.cancellations import persist_cancellations
@@ -139,6 +143,8 @@ class TradingExecutor:
             try:
                 self._preflight_live_strategy(strategy_id)
             except Exception as exc:
+                if exchange_cooldown_seconds(exc):
+                    self._defer_exchange_start(strategy_id, exc)
                 self._last_start_failure = str(exc or "strategyV2.livePreflightFailed")
                 logger.warning("Strategy %s live preflight rejected: %s", strategy_id, exc)
                 return False
@@ -416,6 +422,16 @@ class TradingExecutor:
         if conflict:
             raise RuntimeError(live_conflict_message(conflict))
 
+    def _defer_exchange_start(self, strategy_id, error, strategy=None):
+        from app.services.strategy_command_repository import StrategyCommandRepository
+
+        strategy = strategy or self._load_strategy(strategy_id) or {}
+        StrategyCommandRepository().defer_exchange_start(
+            strategy_id, epoch=int(strategy.get("desired_runtime_epoch") or 1),
+            seconds=exchange_cooldown_seconds(error),
+            token=int(self._runtime_fencing_tokens.get(int(strategy_id), 0)),
+        )
+
     def wait_strategy_running(self, strategy_id: int, timeout: float = 3.0) -> Tuple[bool, str]:
         strategy_id = int(strategy_id)
         deadline = time.monotonic() + max(0.5, float(timeout))
@@ -474,10 +490,11 @@ class TradingExecutor:
         *,
         persist_status: bool = True,
         preserve_run: bool = False,
+        cancel_orders: bool = True,
     ) -> bool:
         strategy_id = int(strategy_id)
         try:
-            if not preserve_run:
+            if not preserve_run and cancel_orders:
                 try:
                     strategy = self._load_strategy(strategy_id) or {}
                     if str(strategy.get("execution_mode") or "signal").strip().lower() == "signal":
@@ -626,6 +643,7 @@ class TradingExecutor:
                     signal_timestamp=signal_ts,
                     market_type=str(row.get("market_type") or strategy.get("market_type") or "swap"),
                     execution_mode="live",
+                    market_category=str(strategy.get("market_category") or ""),
                     leverage=leverage,
                     reason="user_stop_and_close",
                     notification_config=notification_config,
@@ -713,6 +731,7 @@ class TradingExecutor:
                     signal_timestamp=signal_ts,
                     market_type=str(row.get("market_type") or strategy.get("market_type") or "spot"),
                     execution_mode="signal",
+                    market_category=str(strategy.get("market_category") or ""),
                     leverage=leverage,
                     reason="user_stop_and_close",
                     notification_config=notification_config,
@@ -761,6 +780,7 @@ class TradingExecutor:
         state_store: RuntimeStateStore | None = None
         session: StrategyV2LiveSession | None = None
         strategy = None
+        cooldown_exit = False
         try:
             strategy = self._load_strategy(strategy_id)
             if not strategy:
@@ -778,7 +798,12 @@ class TradingExecutor:
 
                 exchange_config = resolve_exchange_config(exchange_config, user_id=user_id)
 
-            service = StrategyV2BacktestService()
+            from functools import partial
+            from app.services.strategy_v2.market_data import load_strategy_frame
+
+            service = StrategyV2BacktestService(frame_fetcher=partial(
+                load_strategy_frame, required_warmup_bars=max(1, program.manifest.warmup_bars),
+            ))
             now = datetime.now(timezone.utc)
             candidates, universe_id = service.resolve_candidates(
                 user_id=user_id,
@@ -1112,6 +1137,8 @@ class TradingExecutor:
             last_market_data_failure_key = ""
             last_market_data_log_at = 0.0
             signal_data_error = ""
+            daily_wait_reason = ""
+            daily_wait_logged_at = 0.0
             last_execution_session_error = ""
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
@@ -1144,8 +1171,7 @@ class TradingExecutor:
             )
             # A preparation event must not execute the initial trading callback.
             # Yield makes scheduler readiness observable before the first risk tick.
-            if self.external_bar_triggers:
-                yield 0.0
+            yield 0.0
 
             while self._is_strategy_running(strategy_id, stop_event):
                 cycle_started = time.monotonic()
@@ -1176,7 +1202,7 @@ class TradingExecutor:
                         symbol_key: value
                         for symbol_key, value in last_prices.items()
                         if price_clock - last_price_seen_at.get(symbol_key, 0.0)
-                        <= price_stale_after
+                        <= execution_price_age_limit(symbol_key, price_stale_after, execution_mode)
                     }
                     risk_timestamp = pd.Timestamp.now(tz="UTC")
                     execution_session_error = ""
@@ -1487,8 +1513,17 @@ class TradingExecutor:
                                     if str(member.get("key") or "") in ready_universe_symbols
                                 ]
                             if not runtime_frames_ready(frequency_frames, signal_members):
+                                from app.services.strategy_runtime.candle_readiness import frame_is_current
+
+                                missing_bars = [
+                                    f"{member['key']}@{tf}"
+                                    for tf, bundle in frequency_frames.items()
+                                    for member in signal_members
+                                    if not frame_is_current(bundle.get(str(member['key'])), member, tf)
+                                ]
                                 raise MarketDataUnavailableError(classify_market_data_failure(
-                                    "Incomplete K-line history: latest closed candle is not ready",
+                                    "Incomplete K-line history: latest closed candle is not ready; "
+                                    + ", ".join(missing_bars[:10]),
                                     exchange_id=str(primary.get("exchange_id") or ""),
                                     market_type=str(primary.get("market_type") or ""),
                                     symbol=str(primary.get("symbol") or ""), timeframe=frequency,
@@ -1521,7 +1556,7 @@ class TradingExecutor:
                                     for symbol_key, value in last_prices.items()
                                     if daily_price_clock
                                     - last_price_seen_at.get(symbol_key, 0.0)
-                                    <= price_stale_after
+                                    <= execution_price_age_limit(symbol_key, price_stale_after, execution_mode)
                                 }
                                 active_prices = filter_execution_prices(
                                     active_prices, equity_quotes,
@@ -1538,6 +1573,20 @@ class TradingExecutor:
                                 )
                             )
                             if daily_policy:
+                                wait_reason = daily_signal_wait_reason(
+                                    daily_members, active_prices, last_price_seen_at,
+                                    clock=time.monotonic(), max_age=price_stale_after,
+                                    quotes=equity_quotes, now=pd.Timestamp.now(tz="UTC"),
+                                    execution_mode=execution_mode,
+                                )
+                                if wait_reason:
+                                    signal_data_error = "marketData.incomplete_market_data"
+                                    if not daily_wait_reason or time.monotonic() - daily_wait_logged_at >= 60:
+                                        append_strategy_log(strategy_id, "warning", wait_reason)
+                                        daily_wait_logged_at = time.monotonic()
+                                elif daily_wait_reason:
+                                    append_strategy_log(strategy_id, "info", "Daily signal quote requirements recovered")
+                                daily_wait_reason = wait_reason
                                 frame_advanced = bool(
                                     frame_advanced
                                     and equity_daily_execution_session(*daily_policy) == signal_session
@@ -1547,12 +1596,7 @@ class TradingExecutor:
                                         signal_session,
                                         daily_policy[0],
                                     )
-                                    and all(
-                                        str(member["key"]) in active_prices
-                                        and time.monotonic() - last_price_seen_at.get(str(member["key"]), 0.0)
-                                        <= price_stale_after
-                                        for member in daily_members
-                                    )
+                                    and not wait_reason
                                 )
                             if frame_advanced or schedule_due:
                                 begin_signal_cycle = getattr(
@@ -1579,6 +1623,11 @@ class TradingExecutor:
                                         intent.position_side,
                                     ) not in protected
                                 ]
+                                if daily_policy:
+                                    append_strategy_log(strategy_id, "info",
+                                        f"Daily signal evaluated: session={signal_session.date()}, "
+                                        f"instruments={len(daily_members)}, intents={len(intents)}, "
+                                        f"broker={account_exchange or 'none'}")
                                 for message in messages:
                                     append_strategy_log(strategy_id, "info", message)
                                 with ExitStack() as batch_contexts:
@@ -1699,12 +1748,13 @@ class TradingExecutor:
                         last_market_data_failure_key = ""
                         last_market_data_log_at = 0.0
                 except Exception as exc:
-                    if isinstance(exc, MarketDataUnavailableError) or str(exc) == "strategyV2.noMarketData":
-                        next_signal_poll = cycle_started + signal_poll
+                    cooldown_seconds = exchange_cooldown_seconds(exc)
+                    if cooldown_seconds or isinstance(exc, MarketDataUnavailableError) or str(exc) == "strategyV2.noMarketData":
+                        next_signal_poll = cycle_started + max(signal_poll, cooldown_seconds)
                         failure = (
                             exc.failure
                             if isinstance(exc, MarketDataUnavailableError)
-                            else classify_market_data_failure("No usable market data")
+                            else classify_market_data_failure(str(exc) if cooldown_seconds else "No usable market data")
                         )
                         failure_key = "|".join((
                             failure.code,
@@ -1712,19 +1762,17 @@ class TradingExecutor:
                             failure.market_type,
                             failure.symbol,
                             failure.timeframe,
-                            failure.technical_detail,
+                            "" if failure.code == "rate_limited" else failure.technical_detail,
                         ))
                         signal_data_error = f"marketData.{failure.code}"
-                        logger.warning(
-                            "Strategy %s market data unavailable (%s): %s",
-                            strategy_id,
-                            failure.code,
-                            failure.technical_detail or failure.message,
-                        )
                         if (
                             failure_key != last_market_data_failure_key
                             or cycle_started - last_market_data_log_at >= 60.0
                         ):
+                            logger.warning(
+                                "Strategy %s market data unavailable (%s): %s",
+                                strategy_id, failure.code, failure.technical_detail or failure.message,
+                            )
                             append_strategy_log(
                                 strategy_id,
                                 "warning",
@@ -1763,12 +1811,18 @@ class TradingExecutor:
         except Exception as exc:
             exit_reason = str(exc)
             self._last_exit_reason[strategy_id] = exit_reason
-            logger.exception("Strategy %s stopped after runtime failure", strategy_id)
-            if isinstance(exc, MarketDataUnavailableError):
-                append_strategy_log(strategy_id, "error", format_market_data_log(exc.failure))
+            cooldown_exit = bool(exchange_cooldown_seconds(exc))
+            if cooldown_exit:
+                self._defer_exchange_start(strategy_id, exc, strategy)
+                logger.warning("Strategy %s waiting for exchange cooldown", strategy_id)
             else:
-                append_strategy_log(strategy_id, "error", exit_reason)
-            if not self.runtime_guard or self.runtime_guard(strategy_id):
+                logger.exception("Strategy %s stopped after runtime failure", strategy_id)
+            level = "warning" if cooldown_exit else "error"
+            if isinstance(exc, MarketDataUnavailableError):
+                append_strategy_log(strategy_id, level, format_market_data_log(exc.failure))
+            else:
+                append_strategy_log(strategy_id, level, exit_reason)
+            if not cooldown_exit and (not self.runtime_guard or self.runtime_guard(strategy_id)):
                 self._mark_stopped(
                     strategy_id,
                     expected_epoch=int(strategy.get("desired_runtime_epoch") or 1) if strategy else None,
@@ -1804,7 +1858,7 @@ class TradingExecutor:
             if market_price_feed is not None:
                 market_price_feed.release()
             with self.lock:
-                preserve_run = strategy_id in self._runtime_handoff_ids
+                preserve_run = cooldown_exit or strategy_id in self._runtime_handoff_ids
             if self.external_bar_triggers and self.runtime_guard and not self.runtime_guard(strategy_id):
                 # A replacement may already have resumed this run under a new lease.
                 preserve_run = True
@@ -1861,9 +1915,9 @@ class TradingExecutor:
         frame_aliases = (str(intent.symbol), str(member.get("key") or ""))
         frame = _instrument_frame(frames, intent_key, *frame_aliases)
         price = float(current_price_override or 0)
-        if price <= 0 and frame is not None and not frame.empty:
+        if (not math.isfinite(price) or price <= 0) and frame is not None and not frame.empty:
             price = float(frame["close"].iloc[-1])
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise RuntimeError(f"strategyV2.priceUnavailable:{intent.symbol}")
 
         symbol = str(member.get("symbol") or "")
@@ -1897,7 +1951,7 @@ class TradingExecutor:
                 target_amount,
                 direction_mode=direction_mode,
             )
-        if market_type == "spot" and target_amount < -1e-12:
+        if market_type == "spot" and member.get("market") != "Futures" and target_amount < -1e-12:
             raise RuntimeError("strategyV2.spotShortUnsupported")
 
         closes_position = abs(target_amount) <= 1e-12 and abs(current_amount) > 1e-12
@@ -1926,6 +1980,8 @@ class TradingExecutor:
         if abs(target_amount - current_amount) * price < MIN_LIVE_ORDER_NOTIONAL and not closes_position:
             return False
 
+        if not math.isfinite(target_amount - current_amount):
+            raise RuntimeError("strategyV2.invalidOrderSize")
         requests = self._order_plan(current_amount, target_amount)
         if (
             execution_mode == "live"
@@ -2092,6 +2148,7 @@ class TradingExecutor:
             signal_timestamp=int(values.get("signal_ts") or time.time()),
             market_type=str(values.get("market_type") or "spot"),
             execution_mode=str(values.get("execution_mode") or "signal"),
+            market_category=str(values.get("market_category") or strategy.get("market_category") or ""),
             exchange_id=str((values.get("exchange_config") or {}).get("exchange_id") or ""),
             credential_id=int((values.get("exchange_config") or {}).get("credential_id") or 0),
             rebalance_group_id=str(values.get("rebalance_group_id") or ""),
@@ -2402,6 +2459,11 @@ class TradingExecutor:
                     self._mark_stopped(strategy_id)
                     break
                 yield tick_seconds
+        except Exception as exc:
+            if exchange_cooldown_seconds(exc):
+                with self.lock:
+                    self._runtime_handoff_ids.add(strategy_id)
+            raise
         finally:
             grid_price_feed.release()
             with self.lock:
@@ -2989,22 +3051,33 @@ class TradingExecutor:
         leverage: float = 1.0,
         market_type: str = "spot",
     ) -> float:
+        value = float(intent.value)
+        if not all(math.isfinite(number) for number in (current, capital, price, leverage, value)):
+            raise RuntimeError("strategyV2.invalidOrderSize")
+        if price <= 0:
+            raise RuntimeError("strategyV2.invalidOrderSize")
         notional_multiplier = (
             max(1.0, float(leverage or 1.0))
             if str(market_type or "").lower() != "spot"
             else 1.0
         )
         if intent.kind == "quantity":
-            return current + float(intent.value)
-        if intent.kind == "value":
-            return current + float(intent.value) * notional_multiplier / price
-        if intent.kind == "target_quantity":
-            return float(intent.value)
-        if intent.kind == "target_value":
-            return float(intent.value) * notional_multiplier / price
-        if intent.kind == "target_percent":
-            return capital * float(intent.value) * notional_multiplier / price
-        raise RuntimeError(f"strategyV2.orderKindUnsupported:{intent.kind}")
+            target = current + value
+        elif intent.kind in {"value", "target_value", "target_percent"}:
+            notional = (capital * value if intent.kind == "target_percent" else value) * notional_multiplier
+            if notional == 0 and value != 0 and (intent.kind != "target_percent" or capital != 0):
+                raise RuntimeError("strategyV2.invalidOrderSize")
+            converted = notional / price
+            if not math.isfinite(converted) or (notional != 0 and converted == 0):
+                raise RuntimeError("strategyV2.invalidOrderSize")
+            target = current + converted if intent.kind == "value" else converted
+        elif intent.kind == "target_quantity":
+            target = value
+        else:
+            raise RuntimeError(f"strategyV2.orderKindUnsupported:{intent.kind}")
+        if not math.isfinite(target):
+            raise RuntimeError("strategyV2.invalidOrderSize")
+        return target
 
     @staticmethod
     def _direction_constrained_target(
@@ -3231,19 +3304,24 @@ class TradingExecutor:
         *,
         equity_quotes=None,
     ) -> dict[str, float]:
+        exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
+        mark_first = [
+            member for member in candidates
+            if exchange_id == "binance" and member.get("market") == "Crypto"
+            and str(member.get("market_type") or "swap").strip().lower() == "swap"
+        ]
         standard_candidates = [
             member
             for member in candidates
             if str(
                 member.get("api_family") or member.get("market_type") or "spot"
-            ).strip().lower() in {"spot", "swap"}
+            ).strip().lower() in {"spot", "swap"} and member not in mark_first
         ]
         quote_options = {"equity_quotes": equity_quotes} if equity_quotes is not None else {}
         prices = cls._live_prices(standard_candidates, **quote_options) if standard_candidates else {}
         from app.services.live_trading.factory import create_client
         from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
 
-        exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
         for member in candidates:
             if str(member.get("market") or "") != "Crypto":
                 continue
@@ -3298,6 +3376,9 @@ class TradingExecutor:
                     instrument_id or symbol,
                     exc,
                 )
+        missing = [member for member in mark_first if str(member.get("key") or "") not in prices]
+        if missing:
+            prices.update(cls._live_prices(missing, **quote_options))
         return prices
 
     @staticmethod

@@ -1,5 +1,7 @@
 # Strategy API V2 Development Guide
 
+> Forthright futures currently support manual trading only. Automated futures strategy execution is disabled; contract specification notes below are retained for future integration.
+
 > Applies to: the current executable QuantDinger strategy contract
 > Audience: first-time strategy authors, indicator-conversion users, and developers targeting both backtest and live execution
 
@@ -157,6 +159,10 @@ A valid response contains <code>valid: true</code> and the manifest. Verify the 
 | MOEX | <code>MOEX:SBER</code> |
 
 The parser also normalizes selected aliases, such as <code>600519.XSHG</code> to <code>CNStock:600519.SH</code> and <code>BTCUSDT</code> to <code>BTC/USDT</code>.
+
+Within an explicit Hong Kong stock context, numeric and HK-prefixed aliases are normalized to five digits plus <code>.HK</code>. Dynamic pool members use this same identity for data, strategy callbacks, deployment validation and execution; duplicate aliases retain their historical membership periods. Public pool source records are not rewritten. This normalization does not apply to Crypto-routed equity products or futures contracts.
+
+This applies to every HKStock universe: Hang Seng (<code>hk_hsi</code>), Hang Seng Tech (<code>hk_tech30</code>), China Enterprises (<code>hk_china_enterprises50</code>), Stock Connect (<code>hk_stock_connect</code>), ETFs (<code>hk_etf</code>), custom pools and watchlists. Pool and index references remain dynamic; use the canonical identifiers returned by <code>get_universe_stocks()</code> / <code>get_index_stocks(...)</code> unchanged for history, factors, positions and orders. Do not strip the prefix/suffix or replace point-in-time constituents with a fixed list. Normalization does not supply missing history or relax live-account eligibility and board-lot requirements. US share classes such as <code>USStock:BRK.B</code> remain unchanged. Catalog underlying metadata may retain <code>00700</code>; it must not replace an exchange product's execution identifier.
 
 Broker-listed securities use <code>Market:Symbol</code> as their canonical strategy identity. Do not append a broker or listing venue such as <code>@NASDAQ</code>, <code>@NYSE</code>, <code>@HKEX</code>, or <code>@spot</code> to <code>USStock</code>, <code>HKStock</code>, <code>CNStock</code>, <code>Forex</code>, <code>Futures</code>, or <code>MOEX</code> identifiers. The runtime keeps broker and listing metadata separately for execution. Ordinary Crypto strategy source uses the product-only suffix <code>@spot</code> or <code>@swap</code>; a live deployment obtains the execution venue from the selected account credential and resolves the matching product there. Use <code>@venue:market_type</code> only when intentionally pinning a venue route or preserving a venue-specific product returned by the catalog. Once present, that explicit venue is part of the data and execution identity and must not be silently changed.
 
@@ -779,7 +785,7 @@ Live execution checks the same protection semantics on an independent price cloc
 
 For live broker equities, this price clock and trading callbacks only evaluate during regular exchange sessions, including holidays, DST, early closes, and lunch breaks. Off-hours quotes do not latch runtime stop-loss/take-profit exits. At reopening, current prices and positions are evaluated again. Never-submitted orders cannot carry across a close or break; they expire locally instead of being replayed at the next open. Broker-accepted orders, native protection, and unknown submission outcomes continue reconciliation. Crypto execution is unchanged.
 
-Equity protection prices must carry the provider's observation time from the current regular-session segment, no more than 90 seconds old and not in the future. This allows minute-bar quote timestamps without treating repeated cache reads as fresh market observations. Missing, expired, or untimed prices cannot trigger automatic exits; the runtime resumes evaluation when usable quotes return. An unchanged price is valid if its observation time is current. Daily equity rebalance price checks use the same rule; historical bars and signal mode are unchanged.
+Equity protection prices must carry the provider's observation time from the current regular-session segment, within `EQUITY_QUOTE_MAX_AGE_MINUTES` and not in the future. Configure this in System Settings → Live Trading: an integer from 1 to 60 minutes, default 16; restart trading/runtime workers after saving. The default accepts 15-minute delayed feeds, whose prices can delay local exits and differ from execution prices. Receipt-cache expiry uses the same equity window; cache hits never renew the provider timestamp. Missing, expired, out-of-session or untimed prices cannot trigger automatic exits; the runtime resumes when usable quotes return. An unchanged price is valid if its timestamp meets the policy. Daily equity rebalance checks use the same rule; historical bars, crypto and signal mode are unchanged.
 
 ---
 
@@ -1066,7 +1072,9 @@ Current live-account boundaries:
 | Exchange equity perpetuals | Binance, OKX, Bitget, Bybit, Gate | <code>stock_perpetual / swap / swap</code>; derivative exposure, Crypto swap direction/leverage rules, and exact native contract required |
 | Binance bStocks | Binance | <code>tokenized_equity / spot / spot</code>; exact catalog symbol such as <code>NVDAB/USDT</code>, ordinary spot order semantics, and no leverage |
 | Unverified exchange equities | HTX | rejected until authoritative product metadata and an execution API family are verified |
-| USStock | Alpaca, IBKR | current broker policy is long-only |
+| USStock | Alpaca, IBKR, Tiger, Webull, Forthright | current broker policy is long-only |
+| HKStock | Tiger, Forthright | long-only |
+| Futures | none | automated strategy execution is disabled; Forthright manual trading only |
 | Other parsed markets | none | backtest/data availability does not imply live support |
 
 Mixed-market live deployment is unsupported. Other markets cannot be forced through a mismatched credential. A live allocation must also keep a compatible quote/settlement currency and API family; do not combine HKD Gate direct equities with USDT equity perpetuals merely because both refer to Hong Kong companies.

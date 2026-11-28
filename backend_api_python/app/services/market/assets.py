@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from app.services.market.instrument_products import PRODUCT_CRYPTO
+from app.services.openapi_brokers.symbols import equity_symbol
 from app.utils.db import get_db_connection
 
 
@@ -112,15 +114,32 @@ def get_market_asset(
 def search_market_assets(*, market: str, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
     normalized_market = _clean(market)
     normalized_keyword = _clean(keyword).upper()
+    if normalized_market == 'HKStock' and not normalized_keyword.isdigit():
+        canonical = equity_symbol(normalized_keyword, 'HKStock')
+        if re.fullmatch(r'\d{5}\.HK', canonical):
+            normalized_keyword = canonical[:-3]
     safe_limit = max(1, min(int(limit or 20), 100))
-    if not normalized_market or not normalized_keyword:
+    if not normalized_market or (not normalized_keyword and normalized_market != 'Futures'):
         return []
 
     like_value = f"%{normalized_keyword}%"
+    futures_clause = ""
+    catalog_params = []
+    if normalized_market == 'Futures':
+        futures_clause = """
+            AND s.product_meta::jsonb->>'expiry' ~ '^[0-9]{8}$'
+            AND s.product_meta::jsonb->>'expiry' >= TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYYMMDD')
+            AND COALESCE(NULLIF(REPLACE(s.product_meta::jsonb->>'last_trade_date', '-', ''), ''), s.product_meta::jsonb->>'expiry') >= TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYYMMDD')
+        """
+        from app.services.market.dated_futures import futures_products
+        if normalized_keyword in {item['symbol'] for item in futures_products()}:
+            futures_clause += " AND s.product_meta::jsonb->>'root' = ?"
+            catalog_params.append(normalized_keyword)
+            like_value = '%%'
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
-            """
+            f"""
             SELECT id, asset_key, market, symbol, name, asset_class, product_type,
                    underlying_market, underlying_symbol, is_active
             FROM qd_market_assets
@@ -129,23 +148,42 @@ def search_market_assets(*, market: str, keyword: str, limit: int = 20) -> list[
               AND EXISTS (
                 SELECT 1 FROM qd_market_symbols s
                 WHERE s.asset_id = qd_market_assets.id AND s.is_active = 1
+                {futures_clause}
               )
             ORDER BY
               CASE WHEN UPPER(symbol) = ? THEN 0 WHEN UPPER(symbol) LIKE ? THEN 1 ELSE 2 END,
               symbol, id
-            LIMIT ?
+            {'' if normalized_market == 'HKStock' else 'LIMIT ?'}
             """,
             (
                 normalized_market,
                 like_value,
                 like_value,
                 like_value,
+                *catalog_params,
                 normalized_keyword,
                 f"{normalized_keyword}%",
-                safe_limit,
+                *([] if normalized_market == 'HKStock' else [safe_limit]),
             ),
         )
         assets = [normalize_asset_row(row) for row in (cur.fetchall() or [])]
+        if normalized_market == 'HKStock':
+            # Collapse legacy aliases before pagination while retaining real catalog IDs.
+            unique = {}
+            for asset in assets:
+                if not asset:
+                    continue
+                symbol = equity_symbol(asset['symbol'], 'HKStock')
+                underlying = equity_symbol(asset['underlying_symbol'], asset['underlying_market'])
+                key = (symbol, asset['product_type'], asset['underlying_market'], underlying)
+                existing = unique.get(key)
+                if existing is None or asset['symbol'] == symbol.removesuffix('.HK'):
+                    unique[key] = asset
+            assets = list(unique.values())[:safe_limit]
+            for asset in assets:
+                canonical = equity_symbol(asset['symbol'], 'HKStock')
+                if re.fullmatch(r'\d{5}\.HK', canonical):
+                    asset['symbol'] = canonical[:-3]
         asset_ids = [int(asset["asset_id"]) for asset in assets if asset]
         products_by_asset: dict[int, list[dict[str, Any]]] = {asset_id: [] for asset_id in asset_ids}
         if asset_ids:
@@ -153,7 +191,7 @@ def search_market_assets(*, market: str, keyword: str, limit: int = 20) -> list[
             cur.execute(
                 f"""
                 SELECT asset_id, exchange AS exchange_id, market_type, instrument_id,
-                       settle_currency, product_type, api_family
+                       settle_currency, product_type, api_family, product_meta
                 FROM qd_market_symbols
                 WHERE asset_id IN ({placeholders}) AND is_active = 1
                 ORDER BY asset_id, exchange, market_type, instrument_id
@@ -173,7 +211,11 @@ def search_market_assets(*, market: str, keyword: str, limit: int = 20) -> list[
         asset["market_types"] = sorted({p["market_type"] for p in products if p.get("market_type")})
         asset["exchange_ids"] = sorted({p["exchange_id"] for p in products if p.get("exchange_id")})
         asset["product_count"] = len(products)
+        if normalized_market == 'Futures':
+            asset['expiry'] = min((p['product_meta'].get('expiry', '') for p in products if p['product_meta'].get('expiry')), default='')
         output.append(asset)
+    if normalized_market == 'Futures':
+        output.sort(key=lambda item: (item.get('expiry', ''), item['symbol']))
     return output
 
 

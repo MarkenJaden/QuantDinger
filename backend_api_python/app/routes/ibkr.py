@@ -13,6 +13,7 @@ from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.utils.auth import login_required, trading_required
 
 from app.utils.logger import get_logger
+from app.utils.broker_order_validation import BrokerOrderValidationError, order_number
 from app.utils.broker_session import BrokerSessionRegistry
 from app.utils.local_brokers import (
     desktop_broker_cloud_reject_message,
@@ -213,7 +214,7 @@ def get_orders():
         if err is not None:
             return err
 
-        orders = client.get_open_orders()
+        orders = client.get_open_orders(raise_on_error=True)
         return jsonify({
             "success": True,
             "data": orders
@@ -224,6 +225,36 @@ def get_orders():
             "success": False,
             "error": str(e)
         }), 500
+
+
+@ibkr_blp.route('/fills', methods=['GET'])
+@login_required
+def get_fills():
+    """Read actual executions; open orders are never transaction history."""
+    try:
+        client, err = _require_connected_client()
+        if err is not None:
+            return err
+        symbol = str(request.args.get('symbol') or '').strip()
+        limit = min(max(int(request.args.get('limit') or 100), 1), 500)
+        rows = client.get_executions(symbol, raise_on_error=True)
+        fills = []
+        for row in rows:
+            timestamp = row.get('executed_at')
+            fills.append({
+                **row,
+                'id': row['execution_id'],
+                'side': {'BOT': 'buy', 'SLD': 'sell'}.get(str(row.get('side') or '').upper(), str(row.get('side') or '').lower()),
+                'filled_qty': row['quantity'],
+                'filled_avg_price': row['price'],
+                'filled_at': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else timestamp,
+                'status': 'filled',
+            })
+        fills.sort(key=lambda row: str(row.get('filled_at') or ''), reverse=True)
+        return jsonify({'success': True, 'data': fills[:limit]})
+    except Exception as exc:
+        logger.warning('IBKR fills request failed: %s', type(exc).__name__)
+        return jsonify({'success': False, 'error': 'brokerAccounts.ordersLoadFailed'}), 500
 
 
 # ==================== Trading ====================
@@ -253,7 +284,10 @@ def place_order():
         # Validate parameters
         symbol = data.get('symbol')
         side = data.get('side')
-        quantity = data.get('quantity')
+        try:
+            quantity = order_number(data.get('quantity'))
+        except BrokerOrderValidationError:
+            return jsonify({"success": False, "error": "brokerAccounts.invalidOrder"}), 400
 
         if not symbol:
             return jsonify({"success": False, "error": "Missing symbol"}), 400
@@ -267,7 +301,10 @@ def place_order():
 
         # Place order
         if order_type == 'limit':
-            price = data.get('price')
+            try:
+                price = order_number(data.get('price'))
+            except BrokerOrderValidationError:
+                return jsonify({"success": False, "error": "brokerAccounts.invalidOrder"}), 400
             if not price or float(price) <= 0:
                 return jsonify({"success": False, "error": "Limit order requires price"}), 400
 
